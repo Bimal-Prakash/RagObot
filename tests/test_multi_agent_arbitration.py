@@ -170,10 +170,15 @@ class TestMultiAgentArbitrationAndGrounding(unittest.IsolatedAsyncioTestCase):
             "REASON: The claim that Bimal P B built RagObot is supported; NASA funding is not mentioned in sources.\n"
             "GROUNDED_ANSWER: RagObot was built by Bimal P B."
         )
+        mock_reval_response = MagicMock()
+        mock_reval_response.content = (
+            "STATUS: FULLY_SUPPORTED\n"
+            "REASON: All remaining claims in pruned answer are directly entailed by source documentation."
+        )
         
         with patch("core.graph.ChatGroq") as mock_chat:
             mock_inst = AsyncMock()
-            mock_inst.ainvoke.return_value = mock_eval_response
+            mock_inst.ainvoke.side_effect = [mock_eval_response, mock_reval_response]
             mock_chat.return_value = mock_inst
             
             is_grounded, reason, clean_answer = await assess_answer_grounding(
@@ -529,7 +534,8 @@ class TestMultiAgentArbitrationAndGrounding(unittest.IsolatedAsyncioTestCase):
             "is_abstained": False,
             "abstention_reason": "",
             "token_count": 150,
-            "was_trimmed": False
+            "was_trimmed": False,
+            "retrieved_docs": self.mock_docs
         }
         
         with patch("api.ragobot_graph.ainvoke", return_value=mock_graph_result):

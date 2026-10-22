@@ -58,6 +58,7 @@ export default function ChatMessage({
                 groqText={message.groqStream}
                 arbiterDebate={message.arbiterDebate}
                 isStreaming={message.isStreaming}
+                stageLabel={message.stageLabel}
                 status={status}
                 onOpenDebate={() => setIsDebateModalOpen(true)}
               />

@@ -314,6 +314,17 @@ export default function App() {
                   msg.id === assistantMsgId ? { ...msg, sources: parsed } : msg
                 )
               );
+            } else if (eventType === 'stage') {
+              setMessages((prev) =>
+                prev.map((msg) =>
+                  msg.id === assistantMsgId
+                    ? {
+                        ...msg,
+                        stageLabel: parsed.label || parsed.stage
+                      }
+                    : msg
+                )
+              );
             } else if (eventType === 'ollama_token') {
               setMessages((prev) =>
                 prev.map((msg) =>
@@ -378,6 +389,7 @@ export default function App() {
                         abstentionReason: parsed.abstention_reason || '',
                         tokenCount: parsed.token_count,
                         wasTrimmed: parsed.was_trimmed,
+                        stageLabel: null,
                         isStreaming: false
                       }
                     : msg

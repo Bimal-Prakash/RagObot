@@ -23,21 +23,25 @@ flowchart TD
 
 ## 🛠️ Core Pillars & Implementation
 
-1. **Self-Checking Concurrency Orchestration Layer (`langgraph`)**:
+1. **Fail-Closed Concurrency Orchestration Layer (`langgraph`)**:
    - Follows strict evidence validation and factual grounding gates (`mermaid-diagram.png`).
-   - `START` routes to `Retrieve ChromaDB chunks`.
-   - **Relevant evidence available?**: If ChromaDB does not contain sufficient verified evidence, the graph short-circuits directly to `Return abstention` to prevent hallucinations.
-   - **Ollama and Groq workers**: Executes concurrent compute nodes (`ollama_worker` & `groq_worker`) in parallel via `asyncio`.
-   - **Consensus Arbiter**: Cross-examines worker outputs against ChromaDB chunks.
-   - **Answer grounded in sources?**: Evaluates factual grounding against source documents. If ungrounded or hallucinated claims are detected, routes to `Return abstention`.
+   - `START` routes to `Retrieve ChromaDB chunks` with context-aware query reformulation and upload-document targeting.
+   - **Relevant evidence available?**: Evaluates retrieved chunks strictly. If evidence is missing, below threshold (0.45), or the evaluator is unavailable, the pipeline **fails closed** to `Return abstention` (no fail-open similarity-only bypasses).
+   - **Ollama and Groq workers**: Executes concurrent compute nodes (`ollama_worker` & `groq_worker`) in parallel via `asyncio`. Worker streams are quarantined behind the validation boundary during computation to prevent unverified content leaks.
+   - **Consensus Arbiter**: Impartial arbitrator evaluates blinded candidate perspectives with randomized presentation order against verified source chunks. If arbiter models fail or time out, the system fails closed to abstention instead of fabricating fallback claims.
+   - **Answer grounded in sources?**: Multi-layer factual grounding validation:
+     - Delimits source evidence in `<untrusted_source_evidence>` tags to defend against prompt injection.
+     - Runs deterministic claim verification on numbers, dates, and metrics against source text.
+     - Subjected to independent secondary revalidation if answers are pruned under `PARTIALLY_SUPPORTED`.
+     - Any residual unsupported claims immediately route to `Return abstention`.
    - **Final response and TTS**: Dispatches the verified, grounded response to native Windows SAPI TTS and UI.
    - Ingestion protocol reads structured Markdown (`.md`) files using `MarkdownHeaderTextSplitter` to retain semantic header hierarchy (`#`, `##`, `###`).
 2. **Dual-Engine Compute Matrix (`groq` + `ollama`)**:
    - **Groq Cloud Engine**: Powered by `ChatGroq` (`llama-3.3-70b-versatile`) as the structural supervisor.
    - **Ollama Local Matrix**: Powered by `ChatOllama` (`llama3.2:3b` / `llama3`) for localized verification.
-3. **Consensus Arbiter Node**:
-   - Neither engine sends raw output directly to the user.
-   - The Consensus Arbiter cross-examines outputs against source documents, resolves conflicts, eliminates hallucinations, and synthesizes a single natural response.
+3. **Consensus Arbiter & Grounding Boundary**:
+   - Worker generation streams remain internal during execution; only verified consensus responses reach the primary conversation stream. Audited candidate drafts and cross-examination notes are accessible for post-run inspection in the 2-Window Debate Arena.
+   - Source citations emitted to the client are traceable directly to the exact chunks evaluated in the completed graph state.
 4. **Context Window & Token Budget Management**:
    - Guarded by `trim_messages()` with `strategy="last"` and `include_system=True`.
    - Prunes history when total tokens exceed `MAX_CONTEXT_TOKENS` (default: 2,000) while permanently anchoring system RAG rules.

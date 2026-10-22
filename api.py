@@ -52,6 +52,7 @@ class QueryRequest(BaseModel):
     model_mode: str = "dual"  # "dual", "local", "cloud"
     local_model: str | None = None
     cloud_model: str | None = None
+    dev_mode: bool = False  # If True, streams raw unverified worker tokens to developer UI; defaults to False (fail-closed)
 
 class GroqSettingsRequest(BaseModel):
     api_key: str | None = None
@@ -334,13 +335,9 @@ async def stream_query(payload: QueryRequest):
             event_queue.put_nowait({"type": event_name, "data": payload_data})
             
         set_stream_listeners(stream_a, stream_b, status_cb)
+        graph_retrieved_docs: list[dict[str, Any]] = []
         
-        # 1. Retrieve RAG chunks (target_doc aware if query references the uploaded doc)
-        target_doc_for_retrieval = effective_uploaded_doc if (effective_uploaded_doc and is_document_referencing_query(query)) else None
-        retrieved_docs = rag_engine.retrieve(query, top_k=config.TOP_K_CHUNKS, target_doc=target_doc_for_retrieval)
-        yield f"event: docs\ndata: {json.dumps(retrieved_docs)}\n\n"
-        
-        # 2. Run graph in background task
+        # 1. Run graph in background task
         async def run_graph_task():
             try:
                 config_dict = {"configurable": {"thread_id": thread_id}}
@@ -389,15 +386,27 @@ async def stream_query(payload: QueryRequest):
             event_type = item["type"]
             data = item["data"]
             
-            if event_type == "ollama_token":
-                yield f"event: ollama_token\ndata: {json.dumps({'token': data})}\n\n"
+            if event_type == "retrieved_docs":
+                graph_retrieved_docs = data.get("docs", [])
+                yield f"event: docs\ndata: {json.dumps(graph_retrieved_docs)}\n\n"
+            elif event_type == "stage":
+                yield f"event: stage\ndata: {json.dumps(data)}\n\n"
+            elif event_type == "ollama_token":
+                # Only stream raw unverified tokens if developer mode is explicitly enabled
+                if payload.dev_mode:
+                    yield f"event: ollama_token\ndata: {json.dumps({'token': data})}\n\n"
             elif event_type == "groq_token":
-                yield f"event: groq_token\ndata: {json.dumps({'token': data})}\n\n"
+                # Only stream raw unverified tokens if developer mode is explicitly enabled
+                if payload.dev_mode:
+                    yield f"event: groq_token\ndata: {json.dumps({'token': data})}\n\n"
             elif event_type == "evidence_status":
                 yield f"event: evidence_status\ndata: {json.dumps(data)}\n\n"
             elif event_type == "validation_status":
                 yield f"event: validation_status\ndata: {json.dumps(data)}\n\n"
             elif event_type == "graph_result":
+                if not graph_retrieved_docs and data.get("retrieved_docs"):
+                    graph_retrieved_docs = data.get("retrieved_docs", [])
+                    yield f"event: docs\ndata: {json.dumps(graph_retrieved_docs)}\n\n"
                 token_count = data.get("token_count", 0)
                 was_trimmed = data.get("was_trimmed", False)
                 session_state["token_count"] = token_count
@@ -414,7 +423,7 @@ async def stream_query(payload: QueryRequest):
                     "id": f"assistant-{int(time.time()*1000)}",
                     "role": "assistant",
                     "content": data.get("final_response", ""),
-                    "sources": retrieved_docs,
+                    "sources": data.get("retrieved_docs") or graph_retrieved_docs,
                     "ollamaStream": data.get("ollama_output", ""),
                     "groqStream": data.get("groq_output", ""),
                     "arbiterDebate": data.get("arbiter_debate", ""),
