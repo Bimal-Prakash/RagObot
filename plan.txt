@@ -1,0 +1,53 @@
+
+📋 PROJECT SPECIFICATION: RagObot Multi-Agent System
+
+Core Objective: Build a headless, highly optimized, multi-agent RAG system named RagObot using LangGraph. The system must orchestrate local and cloud compute layers concurrently, manage tokens strictly using a rolling context window, feature an interactive terminal UI, and hand off the final result directly to the Windows native audio engine for Text-to-Speech (TTS).
+
+🗺️ System Architecture & Data Flow (Grounded Abstention Matrix)
+
+```mermaid
+flowchart TD
+    A[User query] --> B[Retrieve ChromaDB chunks]
+    B --> C{Relevant evidence available?}
+    C -- No --> D[Return abstention]
+    C -- Yes --> E[Ollama and Groq workers]
+    E --> F[Consensus arbiter]
+    F --> G{Answer grounded in sources?}
+    G -- No --> D
+    G -- Yes --> H[Final response and TTS]
+```
+
+🛠️ Core Functional Pillars & Engineering Requirements
+
+
+1. Concurrency Orchestration Layer (langgraph)
+
+• Parallel Execution Topology: The system must be engineered as a stateful graph where START branches out simultaneously into two worker nodes. These nodes must execute in parallel using Python’s asynchronous (asyncio) framework to maximize hardware utilization and minimize latency.
+• Document Sourcing Protocol: The ingestion pipeline reads from structured Markdown (.md) files. The system prioritizes Markdown over raw plain text because its structural markers (headers, subheaders, lists) provide semantic boundaries that improve retrieval accuracy.
+
+2. Dual-Engine Compute Matrix (groq + ollama)
+
+• Groq Cloud Engine: Powered by ChatGroq (configured for a fast model on their developer tier, such as llama-3.3-70b-versatile). It acts as the logic, structural, and syntax supervisor.
+• Ollama Local Engine: Powered by ChatOllama running locally (using llama3 or a similar model). It performs independent, localized verification against the same source data chunks.
+
+3. Consensus Engine (The Arbiter Node)
+
+• Debate & Consensus Pattern: Neither model presents its raw text directly to the user. Instead, both their output streams feed into a central Consensus Arbiter Node.
+• The Synthesis Role: This node cross-examines both perspectives, flags and fixes hallucinations, resolves conflicting statements, merges unique facts, and builds a single unified response structured for natural-sounding speech.
+
+4. Context Window & Token Budget Management
+
+• Token Budget Guard: Right before invoking any LLM call, the system passes the running message state through trim_messages().
+• Pruning Strategy: If the total history length breaches a specified limit (e.g., 2,000 tokens using count_tokens_approximately), it uses strategy="last" to drop the oldest user-assistant turn pairs.
+• System Prompt Anchoring: The trimmer must include include_system=True to guarantee that the fundamental RAG behavioral rules and prompt instructions are never deleted from memory during long conversation threads.
+
+5. Headless Native Hardware Voice Pipeline (win32com)
+
+• Zero UI Overhead Handoff: The entire graph must run completely decoupled from audio execution loops.
+• Audio Dispatch: The moment the graph settles at the END state, the final string is extracted from the consensus payload and pushed straight to the native Windows audio stack using win32com.client.Dispatch("SAPI.SpVoice").
+
+6. The "Wow Factor" Terminal Interface (rich)
+
+• Interactive Cyber-Console: The application must replace plain console printouts with a beautiful terminal layout using the rich library.
+• Live Thought Columns: It must display the ongoing calculations of the Ollama Brain and the Groq Engine side-by-side in real-time streaming layout panels using rich.live.
+• Diagnostic Monitors: The UI must display live visual token counters showing current context window consumption and alert the user with a distinct visual marker when older memory blocks are trimmed.

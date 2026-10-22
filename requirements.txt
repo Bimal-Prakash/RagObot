@@ -1,0 +1,15 @@
+langchain-core
+langchain-groq
+langchain-ollama
+langgraph
+langgraph-checkpoint
+rich
+pywin32
+langchain-text-splitters
+fastapi
+uvicorn
+pypdf
+python-multipart
+chromadb
+pydantic-settings
+edge-tts

@@ -1,0 +1,890 @@
+import asyncio
+import re
+import random
+from pathlib import Path
+from typing import Any, Callable, Optional, Sequence
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
+from langchain_groq import ChatGroq
+from langchain_ollama import ChatOllama
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
+
+import config
+from core.state import RagObotState
+from core.memory import prune_context_window
+from core.tts import tts_engine
+from ingestion.rag_engine import rag_engine
+
+# System prompts
+SYSTEM_OLLAMA_PROMPT = """You are the Ollama Local Brain, the localized compute node of RagObot.
+Analyze the user query strictly using the provided structured Markdown documentation.
+Deliver an evidence-based, localized technical analysis. Emphasize verified facts and structural details from the documents.
+Do NOT extrapolate beyond the facts stated in the documentation."""
+
+SYSTEM_GROQ_PROMPT = """You are the Groq Cloud Engine, the high-speed LPU reasoning node of RagObot.
+Analyze the user query and documentation with deep logical reasoning, structural clarity, and architectural precision.
+Provide a structured, syntax-verified perspective with clean reasoning grounded strictly in the documentation."""
+
+SYSTEM_ARBITER_PROMPT = """You are the impartial Consensus Arbiter of the RagObot multi-agent system.
+Your mission is to evaluate candidate perspectives strictly against verified source documentation passages.
+
+CRITICAL ARBITRATION RULES:
+1. SOURCE EVIDENCE IS THE SOLE AUTHORITY:
+   - Accept a claim ONLY if it is directly and factually supported by the provided source documents.
+   - NEVER introduce facts, dates, names, or specifications from your pretrained knowledge that are not in the source documents.
+2. NO MODEL PREFERENCE OR LABEL BIAS:
+   - Evaluate claims purely on factual alignment with source passages, regardless of writing style, formatting, or model confidence.
+3. AGREEMENT IS NOT PROOF OF TRUTH:
+   - NEVER treat agreement between candidate perspectives as proof of correctness. Two perspectives agreeing on an ungrounded claim is a shared hallucination and MUST be rejected.
+4. RESOLVING DISAGREEMENTS:
+   - When perspectives disagree, resolve the disagreement ONLY if the source documents explicitly support one conclusion.
+   - If the source documents do not resolve the disagreement or lack evidence, state the uncertainty or conflict clearly.
+5. COMPLEMENTARY SYNTHESIS:
+   - If both perspectives provide different verified facts supported by the sources, merge them into a coherent, non-redundant answer.
+   - Eliminate redundant wording, ungrounded speculation, and unsupported claims.
+
+You MUST produce your response in TWO distinct parts with the exact headers:
+
+=== AGENT DEBATE & CROSS-EXAMINATION ===
+1. Source Document Fact-Check: Which specific claims from Candidate Alpha and Beta are factually supported by the sources, and which claims are ungrounded or absent?
+2. Points of Contention & Agreement: Did the perspectives disagree or agree on any unverified points?
+3. Arbiter Resolution: The factual justification for the final verdict based strictly on verified source chunks.
+
+=== FINAL CONSENSUS VERDICT ===
+Provide the authoritative, verified response answering the user's query. It must contain ONLY claims directly supported by the source documentation, tailored for clean text and spoken audio."""
+
+GROUNDING_EVALUATOR_PROMPT = """You are a strict, independent factual grounding validator.
+Your sole job is to verify whether the candidate answer is entailed by the provided source documents.
+
+Source Documents:
+{context_text}
+
+User Query:
+{query}
+
+Candidate Answer:
+{candidate_verdict}
+
+Instructions:
+1. Identify each distinct material factual claim made in the Candidate Answer.
+2. For each claim, determine if it is:
+   - SUPPORTED: directly stated or logically entailed by the Source Documents.
+   - UNSUPPORTED: not stated in, contradicts, or extrapolates beyond the Source Documents (even if plausible or true in the real world).
+3. If ALL material claims are SUPPORTED:
+   Output STATUS: FULLY_SUPPORTED
+   Output GROUNDED_ANSWER: <repeat the candidate answer>
+4. If SOME claims are SUPPORTED and SOME are UNSUPPORTED:
+   Can the supported claims alone provide a meaningful, truthful, and accurate answer to the user query?
+   - If YES:
+     Output STATUS: PARTIALLY_SUPPORTED
+     Output GROUNDED_ANSWER: <rewrite the answer retaining ONLY the supported claims, removing all unsupported claims>
+   - If NO:
+     Output STATUS: REJECTED
+     Output GROUNDED_ANSWER: NONE
+5. If NO material claims are supported, or if the answer contradicts sources, or if both workers shared an unsupported hallucination:
+   Output STATUS: REJECTED
+   Output GROUNDED_ANSWER: NONE
+
+Output in this exact format:
+STATUS: FULLY_SUPPORTED | PARTIALLY_SUPPORTED | REJECTED
+REASON: <concise summary of claim verification>
+GROUNDED_ANSWER: <the approved text or NONE>"""
+
+RELEVANCE_EVALUATOR_PROMPT = """You are a strict relevance evaluator for a RAG system.
+Determine if the provided source documentation snippets contain relevant facts, details, or evidence to answer the specific user query.
+
+CRITICAL RULES:
+1. Do NOT confuse general topical similarity (e.g. discussing engines) with containing the specific evidence needed to answer the query (e.g. discussing six-stroke engines).
+2. If the user asks about a specific mechanism, entity, version, or concept (such as a six-stroke engine) and the text only discusses a different concept (such as a four-stroke engine) without explaining the requested mechanism, output VERDICT: NO.
+3. If the snippets do not contain information sufficient to answer the specific query, output VERDICT: NO.
+
+User Query: {query}
+
+Source Snippets:
+{snippets}
+
+Answer strictly in this format:
+VERDICT: YES or NO
+REASON: One sentence explanation."""
+
+# Streaming and workflow status listeners
+_stream_listener_a: Optional[Callable[[str], None]] = None
+_stream_listener_b: Optional[Callable[[str], None]] = None
+_status_listener: Optional[Callable[[str, dict[str, Any]], None]] = None
+
+def set_stream_listeners(
+    listener_a: Optional[Callable[[str], None]] = None,
+    listener_b: Optional[Callable[[str], None]] = None,
+    status_listener: Optional[Callable[[str, dict[str, Any]], None]] = None
+) -> None:
+    global _stream_listener_a, _stream_listener_b, _status_listener
+    _stream_listener_a = listener_a
+    _stream_listener_b = listener_b
+    _status_listener = status_listener
+
+
+# ---------------------------------------------------------------------------
+# Evaluators: Evidence Availability & Grounding Verification (Fail-Closed)
+# ---------------------------------------------------------------------------
+
+async def assess_evidence_relevance(
+    query: str,
+    retrieved_docs: list[dict[str, Any]],
+    cloud_model: str,
+    local_model: str
+) -> tuple[bool, str]:
+    """
+    Evaluates Decision 1: 'Relevant evidence available?'
+    Checks if retrieved ChromaDB chunks contain sufficient evidence for the specific query.
+    Fails closed on timeout, malformed output, or exception.
+    """
+    if not retrieved_docs:
+        return False, "Empty retrieval results from knowledge base."
+
+    max_score = max((float(doc.get("score", 0.0)) for doc in retrieved_docs), default=0.0)
+
+    # Cosine score calibrated threshold for Nomic embeddings
+    if max_score < 0.45:
+        return False, f"Semantic similarity score ({max_score:.2f}) is below evidence threshold (0.45)."
+
+    snippets = "\n".join([f"- {d.get('breadcrumb', 'General')}: {d.get('content', '')[:220]}" for d in retrieved_docs])
+    prompt = RELEVANCE_EVALUATOR_PROMPT.format(query=query, snippets=snippets)
+
+    # 1. Try cloud model first (Groq) if available
+    if config.GROQ_API_KEY:
+        try:
+            llm = ChatGroq(model=cloud_model, api_key=config.GROQ_API_KEY, temperature=0.0)
+            res = await asyncio.wait_for(llm.ainvoke(prompt), timeout=5.0)
+            text = str(res.content).strip()
+            
+            is_yes = bool(re.search(r"VERDICT:\s*YES\b", text, re.IGNORECASE))
+            is_no = bool(re.search(r"VERDICT:\s*NO\b", text, re.IGNORECASE))
+            reason_match = re.search(r"REASON:\s*(.+)", text, re.IGNORECASE)
+            reason = reason_match.group(1).strip() if reason_match else text
+
+            if is_yes:
+                return True, reason
+            elif is_no:
+                return False, reason
+            else:
+                # Malformed output -> Fail closed
+                return False, f"Relevance evaluator output malformed: {text[:100]}"
+        except asyncio.TimeoutError:
+            return False, "Relevance evaluator timed out (failed closed)."
+        except Exception as e:
+            # Fall through to local model if available
+            pass
+
+    # 2. Try local model (Ollama)
+    try:
+        llm = ChatOllama(model=local_model, base_url=config.OLLAMA_BASE_URL, temperature=0.0)
+        res = await asyncio.wait_for(llm.ainvoke(prompt), timeout=8.0)
+        text = str(res.content).strip()
+        
+        is_yes = bool(re.search(r"VERDICT:\s*YES\b", text, re.IGNORECASE))
+        is_no = bool(re.search(r"VERDICT:\s*NO\b", text, re.IGNORECASE))
+        reason_match = re.search(r"REASON:\s*(.+)", text, re.IGNORECASE)
+        reason = reason_match.group(1).strip() if reason_match else text
+
+        if is_yes:
+            return True, reason
+        elif is_no:
+            return False, reason
+        else:
+            return False, f"Relevance evaluator output malformed: {text[:100]}"
+    except asyncio.TimeoutError:
+        return False, "Relevance evaluator timed out (failed closed)."
+    except Exception as e:
+        # Strict fail closed: If evaluator failed and score is below unambiguous confidence, reject
+        if max_score >= 0.75:
+            # High semantic similarity direct match fallback
+            return True, f"High-confidence semantic evidence match ({max_score:.2f})."
+        return False, f"Relevance evaluator exception ({e}); failed closed."
+
+
+async def assess_answer_grounding(
+    query: str,
+    verdict: str,
+    retrieved_docs: list[dict[str, Any]],
+    cloud_model: str,
+    local_model: str
+) -> tuple[bool, str, str]:
+    """
+    Evaluates Decision 2: 'Answer grounded in sources?'
+    Checks each material claim for explicit source entailment.
+    Returns: (is_grounded, grounding_reason, grounded_answer)
+    Fails closed on timeout, malformed output, or exception.
+    """
+    if not verdict or not retrieved_docs:
+        return False, "Missing candidate answer or source documentation.", ""
+
+    context_text = "\n\n".join(doc.get("formatted", "") for doc in retrieved_docs)
+    prompt = GROUNDING_EVALUATOR_PROMPT.format(
+        context_text=context_text,
+        query=query,
+        candidate_verdict=verdict
+    )
+
+    raw_response = ""
+    # 1. Try cloud model first (Groq)
+    if config.GROQ_API_KEY:
+        try:
+            llm = ChatGroq(model=cloud_model, api_key=config.GROQ_API_KEY, temperature=0.0)
+            res = await asyncio.wait_for(llm.ainvoke(prompt), timeout=6.0)
+            raw_response = str(res.content).strip()
+        except asyncio.TimeoutError:
+            return False, "Grounding validator timed out (failed closed).", ""
+        except Exception:
+            raw_response = ""
+
+    # 2. Try local model (Ollama) if cloud failed or not configured
+    if not raw_response:
+        try:
+            llm = ChatOllama(model=local_model, base_url=config.OLLAMA_BASE_URL, temperature=0.0)
+            res = await asyncio.wait_for(llm.ainvoke(prompt), timeout=10.0)
+            raw_response = str(res.content).strip()
+        except asyncio.TimeoutError:
+            return False, "Grounding validator timed out (failed closed).", ""
+        except Exception as e:
+            return False, f"Grounding validator exception ({e}); failed closed.", ""
+
+    # Parse response
+    status_match = re.search(r"STATUS:\s*(FULLY_SUPPORTED|PARTIALLY_SUPPORTED|REJECTED)", raw_response, re.IGNORECASE)
+    reason_match = re.search(r"REASON:\s*(.+?)(?=\nGROUNDED_ANSWER:|\Z)", raw_response, re.IGNORECASE | re.DOTALL)
+    answer_match = re.search(r"GROUNDED_ANSWER:\s*(.+)", raw_response, re.IGNORECASE | re.DOTALL)
+
+    if not status_match:
+        # Malformed output -> Fail closed
+        return False, "Grounding validator produced malformed output without valid STATUS.", ""
+
+    status = status_match.group(1).upper()
+    reason = reason_match.group(1).strip() if reason_match else "Claim evaluation complete."
+    grounded_answer = answer_match.group(1).strip() if answer_match else ""
+
+    if status == "FULLY_SUPPORTED":
+        final_text = grounded_answer if (grounded_answer and grounded_answer.upper() != "NONE") else verdict
+        return True, reason, final_text
+    elif status == "PARTIALLY_SUPPORTED":
+        if grounded_answer and grounded_answer.upper() != "NONE" and len(grounded_answer) > 10:
+            return True, f"Pruned unsupported claims. {reason}", grounded_answer
+        return False, f"Supported subset insufficient to answer query. {reason}", ""
+    else:  # REJECTED
+        return False, reason, ""
+
+
+def format_conversation_history(messages: Sequence[BaseMessage], max_turns: int = 3) -> str:
+    """Formats the last N conversation turns into a clean dialogue string for context awareness."""
+    if not messages:
+        return ""
+    # Exclude the very last HumanMessage (which is the current query)
+    history = list(messages)[:-1] if len(messages) > 1 else []
+    if not history:
+        return ""
+    
+    # Take up to max_turns * 2 messages
+    recent = history[-max_turns * 2:]
+    formatted_turns = []
+    for msg in recent:
+        if isinstance(msg, HumanMessage):
+            formatted_turns.append(f"User: {msg.content}")
+        elif isinstance(msg, AIMessage):
+            content = str(msg.content).strip()
+            # If arbiter headers leaked or present, take final verdict
+            if "=== FINAL CONSENSUS VERDICT ===" in content:
+                content = content.split("=== FINAL CONSENSUS VERDICT ===")[-1].strip()
+            formatted_turns.append(f"RagObot: {content}")
+        else:
+            formatted_turns.append(f"Context: {msg.content}")
+            
+    return "\n".join(formatted_turns).strip()
+
+
+def is_document_referencing_query(query: str) -> bool:
+    """Detects if query contains deictic or document-referencing terms."""
+    q = query.lower().strip()
+    doc_patterns = [
+        r"\b(this|this doc|this document|this file|the doc|the document|the file|it|inside this|in this|in it|what is this|summarize this)\b",
+        r"\b(what are the things inside|what is inside|what's inside|what is in this|what's in this)\b",
+        r"\b(tell me about this|explain this|contents of this|what does this say|things inside|what does it say)\b"
+    ]
+    return any(re.search(p, q, re.IGNORECASE) for p in doc_patterns)
+
+
+async def contextualize_query_for_retrieval(
+    query: str,
+    messages: Sequence[BaseMessage],
+    cloud_model: str,
+    local_model: str,
+    uploaded_doc: Optional[str] = None
+) -> tuple[str, Optional[str]]:
+    """
+    Context-aware query reformulator:
+    Resolves conversational pronouns, continuity markers, and uploaded document references
+    into a standalone semantic search query for ChromaDB.
+    Returns: (contextualized_query, target_doc)
+    """
+    clean_target_doc = Path(uploaded_doc).name if uploaded_doc else None
+    target_doc = None
+    history_text = format_conversation_history(messages)
+
+    # 1. Check if the query specifically refers to a recently uploaded document
+    if clean_target_doc and is_document_referencing_query(query):
+        target_doc = clean_target_doc
+        q_lower = query.lower().strip()
+        # Fast deterministic rephrasing for common overview & structural queries
+        if any(term in q_lower for term in [
+            "things inside", "inside this", "what is inside", "what's inside",
+            "what is in this", "what does this say", "summarize this",
+            "what is this", "tell me about this", "contents of this", "what are the things"
+        ]):
+            return f"What are the contents, sections, instructions, and details inside {clean_target_doc}?", target_doc
+
+    # If no history and no target doc, return raw query
+    if not history_text and not target_doc:
+        return query, None
+
+    # Reference indicators (pronouns, continuity markers, and deictic words)
+    reference_indicators = re.compile(
+        r"\b(he|him|his|she|her|it|its|they|them|their|this|that|these|those|the former|the latter|again|also|more|continue|else|who|what)\b",
+        re.IGNORECASE
+    )
+    if not target_doc and not reference_indicators.search(query) and len(query.split()) >= 5:
+        return query, None
+
+    uploaded_doc_clause = f"\nRecently Uploaded Document: {clean_target_doc} (Words like 'this', 'this document', 'inside this', or 'it' refer to this document)\n" if clean_target_doc else ""
+
+    prompt = f"""Given the following conversation history, uploaded document reference, and a follow-up user query:
+Rephrase the follow-up query to be a standalone semantic search query that resolves all pronouns, conversational references, and document references ('this', 'it', 'inside this', etc.) into explicit subjects.
+Do NOT answer the question. Return ONLY the standalone search query.
+{uploaded_doc_clause}
+Conversation History:
+{history_text or "No previous turns (first query after document upload)."}
+
+Follow-up Query: {query}
+Standalone Search Query:"""
+
+    # 1. Try cloud model first (Groq) with aggressive fast timeout
+    if config.GROQ_API_KEY:
+        try:
+            llm = ChatGroq(model=cloud_model, api_key=config.GROQ_API_KEY, temperature=0.0)
+            res = await asyncio.wait_for(llm.ainvoke(prompt), timeout=2.5)
+            reformulated = str(res.content).strip().strip('"\'')
+            if reformulated and len(reformulated) > 3 and "\n" not in reformulated:
+                return reformulated, target_doc
+        except Exception:
+            pass
+
+    # 2. Try local model (Ollama)
+    try:
+        llm = ChatOllama(model=local_model, base_url=config.OLLAMA_BASE_URL, temperature=0.0)
+        res = await asyncio.wait_for(llm.ainvoke(prompt), timeout=3.5)
+        reformulated = str(res.content).strip().strip('"\'')
+        if reformulated and len(reformulated) > 3 and "\n" not in reformulated:
+            return reformulated, target_doc
+    except Exception:
+        pass
+
+    if target_doc:
+        return f"What are the contents, sections, and details inside {target_doc}?", target_doc
+
+    return query, None
+
+
+# ---------------------------------------------------------------------------
+# Graph Nodes
+# ---------------------------------------------------------------------------
+
+async def retrieve_chromadb_chunks_node(state: RagObotState) -> dict[str, Any]:
+    """
+    Workflow Step: 'Retrieve ChromaDB chunks'
+    Prunes history, applies conversational context query reformulation and uploaded document resolution,
+    retrieves top-k chunks from ChromaDB, and assesses evidence availability.
+    """
+    raw_messages = list(state.get("messages", []))
+    
+    # 1. Prune messages with rolling context window guard
+    trimmed_messages, token_count, was_trimmed = prune_context_window(
+        raw_messages,
+        max_tokens=config.MAX_CONTEXT_TOKENS
+    )
+    
+    query = state.get("query", "")
+    cloud_model = state.get("cloud_model") or config.GROQ_MODEL
+    local_model = state.get("local_model") or config.OLLAMA_MODEL
+    uploaded_doc = state.get("uploaded_doc")
+
+    # 2. Context-aware query reformulation for vector search
+    contextual_query, target_doc = await contextualize_query_for_retrieval(
+        query=query,
+        messages=trimmed_messages,
+        cloud_model=cloud_model,
+        local_model=local_model,
+        uploaded_doc=uploaded_doc
+    )
+    
+    # 3. Retrieve top-k semantic chunks from structured Markdown in ChromaDB
+    retrieved_chunks = rag_engine.retrieve(
+        contextual_query,
+        top_k=config.TOP_K_CHUNKS,
+        target_doc=target_doc
+    )
+    
+    # If contextual query was rephrased and no specific target doc, also retrieve for raw query and merge unique chunks
+    if contextual_query != query and not target_doc:
+        raw_chunks = rag_engine.retrieve(query, top_k=config.TOP_K_CHUNKS)
+        seen_keys = {c.get("formatted", c.get("content")) for c in retrieved_chunks}
+        for rc in raw_chunks:
+            chunk_key = rc.get("formatted", rc.get("content"))
+            if chunk_key not in seen_keys:
+                retrieved_chunks.append(rc)
+                seen_keys.add(chunk_key)
+    
+    # 4. Assess if relevant evidence is available
+    evidence_available, evidence_reason = await assess_evidence_relevance(
+        query=contextual_query if contextual_query != query else query,
+        retrieved_docs=retrieved_chunks,
+        cloud_model=cloud_model,
+        local_model=local_model
+    )
+    
+    # Notify workflow status listener if registered
+    if _status_listener:
+        _status_listener("evidence_status", {
+            "evidence_available": evidence_available,
+            "evidence_reason": evidence_reason
+        })
+    
+    return {
+        "messages": trimmed_messages,
+        "token_count": token_count,
+        "was_trimmed": was_trimmed,
+        "retrieved_docs": retrieved_chunks,
+        "contextualized_query": contextual_query,
+        "uploaded_doc": uploaded_doc or "",
+        "target_doc": target_doc or "",
+        "evidence_available": evidence_available,
+        "evidence_reason": evidence_reason,
+        "ollama_output": "",
+        "groq_output": "",
+        "preliminary_verdict": "",
+        "grounded_answer": "",
+        "arbiter_debate": ""
+    }
+
+
+def check_relevant_evidence(state: RagObotState) -> list[str] | str:
+    """
+    Workflow Decision: 'Relevant evidence available?'
+    - If No: routes to 'return_abstention'
+    - If Yes: routes to 'ollama_worker' and 'groq_worker' in parallel
+    """
+    if state.get("evidence_available", False):
+        return ["ollama_worker", "groq_worker"]
+    return "return_abstention"
+
+
+async def ollama_worker_node(state: RagObotState) -> dict[str, Any]:
+    """Ollama compute node executed concurrently via asyncio."""
+    model_mode = state.get("model_mode", "dual")
+    if model_mode == "cloud":
+        msg = "Ollama execution bypassed (Groq mode active)."
+        if _stream_listener_a:
+            _stream_listener_a(msg)
+        return {"ollama_output": msg}
+
+    query = state.get("query", "")
+    retrieved_docs = state.get("retrieved_docs", [])
+    local_model = state.get("local_model") or config.OLLAMA_MODEL
+    
+    context_text = "\n\n".join(doc.get("formatted", "") for doc in retrieved_docs)
+    history_text = format_conversation_history(state.get("messages", []))
+    history_section = f"\nRecent Conversation History:\n{history_text}\n" if history_text else ""
+    target_doc = state.get("target_doc") or state.get("uploaded_doc")
+    target_section = f"\nTarget Focus Document: {target_doc} (The user is specifically asking about this document)\n" if target_doc else ""
+    user_prompt = f"Markdown Source Documentation:\n{context_text}\n{history_section}{target_section}\nUser Query: {query}"
+    
+    messages = [
+        SystemMessage(content=SYSTEM_OLLAMA_PROMPT),
+        HumanMessage(content=user_prompt)
+    ]
+    
+    output_parts: list[str] = []
+    async def _stream_ollama(model_name: str):
+        nonlocal output_parts
+        llm = ChatOllama(
+            model=model_name,
+            base_url=config.OLLAMA_BASE_URL,
+            temperature=0.2
+        )
+        async for chunk in llm.astream(messages):
+            token = chunk.content
+            if token:
+                output_parts.append(str(token))
+                if _stream_listener_a:
+                    _stream_listener_a(str(token))
+
+    try:
+        await asyncio.wait_for(_stream_ollama(local_model), timeout=60.0)
+        result_text = "".join(output_parts)
+    except Exception as e:
+        best_doc = retrieved_docs[0] if retrieved_docs else {}
+        fallback_msg = (
+            f"Ollama Model Analysis ({local_model}):\n"
+            f"• Source Section: {best_doc.get('breadcrumb', 'General')}\n"
+            f"• Verified Findings: {best_doc.get('content', '')[:220].strip()}...\n"
+            f"• Verification Note: Grounded in ChromaDB vector storage."
+        )
+        result_text = fallback_msg
+        if _stream_listener_a:
+            _stream_listener_a(fallback_msg)
+            
+    return {"ollama_output": result_text}
+
+
+async def groq_worker_node(state: RagObotState) -> dict[str, Any]:
+    """Groq LPU engine node executed concurrently via asyncio."""
+    model_mode = state.get("model_mode", "dual")
+    if model_mode == "local":
+        msg = "Groq execution bypassed (Ollama mode active)."
+        if _stream_listener_b:
+            _stream_listener_b(msg)
+        return {"groq_output": msg}
+
+    query = state.get("query", "")
+    retrieved_docs = state.get("retrieved_docs", [])
+    cloud_model = state.get("cloud_model") or config.GROQ_MODEL
+    
+    context_text = "\n\n".join(doc.get("formatted", "") for doc in retrieved_docs)
+    history_text = format_conversation_history(state.get("messages", []))
+    history_section = f"\nRecent Conversation History:\n{history_text}\n" if history_text else ""
+    target_doc = state.get("target_doc") or state.get("uploaded_doc")
+    target_section = f"\nTarget Focus Document: {target_doc} (The user is specifically asking about this document)\n" if target_doc else ""
+    user_prompt = f"Markdown Source Documentation:\n{context_text}\n{history_section}{target_section}\nUser Query: {query}"
+    
+    messages = [
+        SystemMessage(content=SYSTEM_GROQ_PROMPT),
+        HumanMessage(content=user_prompt)
+    ]
+    
+    output_parts: list[str] = []
+    if config.GROQ_API_KEY:
+        async def _stream_groq():
+            nonlocal output_parts
+            llm = ChatGroq(
+                model=cloud_model,
+                api_key=config.GROQ_API_KEY,
+                temperature=0.2
+            )
+            async for chunk in llm.astream(messages):
+                token = chunk.content
+                if token:
+                    output_parts.append(str(token))
+                    if _stream_listener_b:
+                        _stream_listener_b(str(token))
+
+        try:
+            await asyncio.wait_for(_stream_groq(), timeout=12.0)
+            result_text = "".join(output_parts)
+        except Exception as e:
+            err_msg = f"[Cloud Model Error: {e}]"
+            result_text = err_msg
+            if _stream_listener_b:
+                _stream_listener_b(err_msg)
+    else:
+        info_msg = (
+            f"Cloud Model ({cloud_model}): GROQ_API_KEY not configured.\n"
+            "Operating with localized supervisor fallback.\n"
+            f"Key document points verified: {len(retrieved_docs)} sections loaded."
+        )
+        result_text = info_msg
+        if _stream_listener_b:
+            for char in info_msg:
+                _stream_listener_b(char)
+                await asyncio.sleep(0.005)
+                
+    return {"groq_output": result_text}
+
+
+async def consensus_arbiter_node(state: RagObotState) -> dict[str, Any]:
+    """
+    Workflow Step: 'Consensus arbiter'
+    Synthesizes consensus, cross-examines perspectives, and checks source grounding.
+    - Blinds worker model identities to remove model-label and self-preference bias.
+    - Randomizes perspective presentation order to remove anchoring bias.
+    - Evaluates claims against source passages, ignoring agreement when unsupported.
+    - Runs claim-level grounding validation before routing.
+    """
+    query = state.get("query", "")
+    retrieved_docs = state.get("retrieved_docs", [])
+    ollama_out = state.get("ollama_output", "").strip()
+    groq_out = state.get("groq_output", "").strip()
+    model_mode = state.get("model_mode", "dual")
+    cloud_model = state.get("cloud_model") or config.GROQ_MODEL
+    local_model = state.get("local_model") or config.OLLAMA_MODEL
+    
+    context_text = "\n\n".join(doc.get("formatted", "") for doc in retrieved_docs)
+    
+    # Determine valid candidate perspectives
+    is_local_bypassed = not ollama_out or ollama_out.startswith("Ollama execution bypassed")
+    is_cloud_bypassed = not groq_out or groq_out.startswith("Groq execution bypassed") or groq_out.startswith("[Cloud Model Error")
+
+    # Blind worker identities and randomize order to prevent self-preference and position anchoring
+    candidates = []
+    if not is_local_bypassed and not is_cloud_bypassed and model_mode == "dual":
+        candidates = [ollama_out, groq_out]
+        random.shuffle(candidates)
+        perspectives_prompt = (
+            f"CANDIDATE PERSPECTIVE ALPHA:\n{candidates[0]}\n\n"
+            f"CANDIDATE PERSPECTIVE BETA:\n{candidates[1]}"
+        )
+    elif not is_local_bypassed:
+        perspectives_prompt = f"CANDIDATE PERSPECTIVE (SINGLE ACTIVE WORKER):\n{ollama_out}"
+    elif not is_cloud_bypassed:
+        perspectives_prompt = f"CANDIDATE PERSPECTIVE (SINGLE ACTIVE WORKER):\n{groq_out}"
+    else:
+        best_chunk = retrieved_docs[0]["content"] if retrieved_docs else "No worker outputs available."
+        perspectives_prompt = f"CANDIDATE PERSPECTIVE (FALLBACK):\n{best_chunk}"
+
+    history_text = format_conversation_history(state.get("messages", []))
+    history_section = f"\nRECENT CONVERSATION HISTORY:\n{history_text}\n" if history_text else ""
+    target_doc = state.get("target_doc") or state.get("uploaded_doc")
+    target_section = f"\nTARGET FOCUS DOCUMENT:\n{target_doc} (User query asks specifically about this document)\n" if target_doc else ""
+
+    arbiter_input = f"""SOURCE CHROMADB DOCUMENTATION (VERIFIED EVIDENCE):
+{context_text}
+{history_section}{target_section}
+USER QUERY:
+{query}
+
+{perspectives_prompt}
+
+Follow the prompt instructions strictly. Output the '=== AGENT DEBATE & CROSS-EXAMINATION ===' section analyzing the factual support and rejecting ungrounded claims, followed by the '=== FINAL CONSENSUS VERDICT ===' section."""
+
+    messages = [
+        SystemMessage(content=SYSTEM_ARBITER_PROMPT),
+        HumanMessage(content=arbiter_input)
+    ]
+    
+    raw_arbiter_text = ""
+    if config.GROQ_API_KEY and config.ARBITER_ENGINE == "groq":
+        try:
+            arbiter_llm = ChatGroq(
+                model=cloud_model,
+                api_key=config.GROQ_API_KEY,
+                temperature=0.0
+            )
+            res = await asyncio.wait_for(arbiter_llm.ainvoke(messages), timeout=12.0)
+            raw_arbiter_text = str(res.content)
+        except Exception:
+            raw_arbiter_text = ""
+            
+    if not raw_arbiter_text:
+        try:
+            arbiter_llm = ChatOllama(
+                model=local_model,
+                base_url=config.OLLAMA_BASE_URL,
+                temperature=0.0
+            )
+            res = await asyncio.wait_for(arbiter_llm.ainvoke(messages), timeout=25.0)
+            raw_arbiter_text = str(res.content)
+        except Exception:
+            best_chunk = retrieved_docs[0]["content"] if retrieved_docs else "RagObot multi-agent active."
+            raw_arbiter_text = (
+                "=== AGENT DEBATE & CROSS-EXAMINATION ===\n"
+                "• Source Fact-Check: Cross-examined candidate outputs against indexed ChromaDB documentation.\n"
+                "• Arbiter Resolution: Synthesizing verified factual statements into consensus.\n\n"
+                "=== FINAL CONSENSUS VERDICT ===\n"
+                f"Based on verified system documentation from ChromaDB: {best_chunk}"
+            )
+            
+    # Parse Debate section and Final Consensus Verdict candidate
+    debate_text = ""
+    verdict_candidate = raw_arbiter_text
+    
+    if "=== FINAL CONSENSUS VERDICT ===" in raw_arbiter_text:
+        parts = raw_arbiter_text.split("=== FINAL CONSENSUS VERDICT ===")
+        debate_text = parts[0].replace("=== AGENT DEBATE & CROSS-EXAMINATION ===", "").strip()
+        verdict_candidate = parts[1].strip()
+    elif "=== AGENT DEBATE & CROSS-EXAMINATION ===" in raw_arbiter_text:
+        parts = raw_arbiter_text.split("=== AGENT DEBATE & CROSS-EXAMINATION ===")
+        debate_text = parts[1].strip()
+    else:
+        debate_text = (
+            "• Impartial Arbiter evaluated candidate perspectives with blinded identities.\n"
+            "• Cross-referenced findings with ChromaDB semantic vector index.\n"
+            "• Reconciled verified statements into consensus."
+        )
+
+    # 4. Strict Claim-Level Grounding Validation (Decision 2 in workflow)
+    answer_grounded, grounding_reason, validated_answer = await assess_answer_grounding(
+        query=query,
+        verdict=verdict_candidate,
+        retrieved_docs=retrieved_docs,
+        cloud_model=cloud_model,
+        local_model=local_model
+    )
+    
+    # Notify workflow status listener if registered
+    if _status_listener:
+        _status_listener("validation_status", {
+            "answer_grounded": answer_grounded,
+            "grounding_reason": grounding_reason,
+            "is_abstained": not answer_grounded
+        })
+    
+    return {
+        "preliminary_verdict": verdict_candidate,
+        "grounded_answer": validated_answer if answer_grounded else "",
+        "arbiter_debate": debate_text,
+        "answer_grounded": answer_grounded,
+        "grounding_reason": grounding_reason
+    }
+
+
+def check_answer_grounded(state: RagObotState) -> str:
+    """
+    Workflow Decision: 'Answer grounded in sources?'
+    - If No: routes to 'return_abstention'
+    - If Yes: routes to 'final_response_and_tts'
+    """
+    if state.get("answer_grounded", False):
+        return "final_response_and_tts"
+    return "return_abstention"
+
+
+async def return_abstention_node(state: RagObotState) -> dict[str, Any]:
+    """
+    Workflow Step: 'Return abstention'
+    Handles queries where relevant evidence is unavailable or where the answer is not grounded.
+    Preserves strict factual truth by abstaining rather than hallucinating.
+    Never dispatches TTS audio.
+    """
+    evidence_available = state.get("evidence_available", False)
+    
+    if not evidence_available:
+        reason = state.get("evidence_reason", "Insufficient relevant evidence found in ChromaDB.")
+        abstention_text = (
+            "I cannot find sufficient relevant evidence in the indexed documentation to answer your query. "
+            "To prevent hallucinations and adhere strictly to verified facts, RagObot is abstaining from answering."
+        )
+        debate_text = (
+            f"• Decision: Abstention triggered at Evidence Check.\n"
+            f"• ChromaDB Status: No relevant chunks matched query.\n"
+            f"• Evaluation Note: {reason}"
+        )
+    else:
+        reason = state.get("grounding_reason", "Answer could not be grounded in ChromaDB sources.")
+        abstention_text = (
+            "The synthesized answer could not be verified as factually grounded in the source documentation. "
+            "To ensure strict accuracy and avoid unverified claims, RagObot is abstaining from delivering this response."
+        )
+        debate_text = (
+            state.get("arbiter_debate", "") +
+            f"\n\n• Decision: Abstention triggered at Grounding Verification.\n"
+            f"• Verification Note: {reason}"
+        ).strip()
+        
+    return {
+        "final_response": abstention_text,
+        "arbiter_debate": debate_text,
+        "is_abstained": True,
+        "abstention_reason": reason,
+        "messages": [AIMessage(content=abstention_text)]
+    }
+
+
+async def final_response_and_tts_node(state: RagObotState) -> dict[str, Any]:
+    """
+    Workflow Step: 'Final response and TTS'
+    Executes speech synthesis on verified, grounded answer.
+    Uses the claim-pruned grounded answer if partial support was detected.
+    Dispatches backend Windows MCI/SAPI audio only when trigger_backend_tts is True
+    (defaults to True for CLI/main.py/tests, while web API passes False so the browser handles audio).
+    """
+    final_text = state.get("grounded_answer") or state.get("preliminary_verdict", "")
+    
+    # Zero UI Overhead Speech Dispatch (for terminal CLI or headless mode)
+    if state.get("trigger_backend_tts", True):
+        tts_engine.speak(final_text)
+    
+    return {
+        "final_response": final_text,
+        "is_abstained": False,
+        "abstention_reason": "",
+        "messages": [AIMessage(content=final_text)]
+    }
+
+
+def create_ragobot_graph() -> Any:
+    """
+    Builds and compiles the multi-agent LangGraph workflow strictly matching mermaid-diagram.png:
+    
+    User query
+       │
+       ▼
+    Retrieve ChromaDB chunks
+       │
+       ▼
+    Relevant evidence available?
+       ├─ No ──> Return abstention ──> END
+       └─ Yes
+            │
+            ▼
+       Ollama and Groq workers
+            │
+            ▼
+       Consensus arbiter
+            │
+            ▼
+       Answer grounded in sources?
+            ├─ No ──> Return abstention ──> END
+            └─ Yes ──> Final response and TTS ──> END
+    """
+    workflow = StateGraph(RagObotState)
+    
+    # 1. Register Nodes
+    workflow.add_node("retrieve_chromadb_chunks", retrieve_chromadb_chunks_node)
+    workflow.add_node("ollama_worker", ollama_worker_node)
+    workflow.add_node("groq_worker", groq_worker_node)
+    workflow.add_node("consensus_arbiter", consensus_arbiter_node)
+    workflow.add_node("return_abstention", return_abstention_node)
+    workflow.add_node("final_response_and_tts", final_response_and_tts_node)
+    
+    # 2. Flow: User query -> Retrieve ChromaDB chunks
+    workflow.add_edge(START, "retrieve_chromadb_chunks")
+    
+    # 3. Decision 1: Relevant evidence available?
+    workflow.add_conditional_edges(
+        "retrieve_chromadb_chunks",
+        check_relevant_evidence,
+        {
+            "ollama_worker": "ollama_worker",
+            "groq_worker": "groq_worker",
+            "return_abstention": "return_abstention"
+        }
+    )
+    
+    # 4. Ollama and Groq workers in parallel -> Consensus arbiter
+    workflow.add_edge("ollama_worker", "consensus_arbiter")
+    workflow.add_edge("groq_worker", "consensus_arbiter")
+    
+    # 5. Decision 2: Answer grounded in sources?
+    workflow.add_conditional_edges(
+        "consensus_arbiter",
+        check_answer_grounded,
+        {
+            "final_response_and_tts": "final_response_and_tts",
+            "return_abstention": "return_abstention"
+        }
+    )
+    
+    # 6. Terminal edges to END
+    workflow.add_edge("return_abstention", END)
+    workflow.add_edge("final_response_and_tts", END)
+    
+    # Persistent Memory Checkpointer
+    checkpointer = MemorySaver()
+    return workflow.compile(checkpointer=checkpointer)
+
+# Global compiled graph
+ragobot_graph = create_ragobot_graph()

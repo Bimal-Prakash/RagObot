@@ -1,0 +1,20 @@
+Build “GameSmith”—an AI game master that turns your room into a playable escape room.
+You scan your room with your phone, choose a theme—detective mystery, sci-fi malfunction, treasure hunt—and it creates a game using objects already around you.
+For example:
+Your laptop displays a distress signal.
+A voice says: “The clock holds the first coordinate.”
+You solve a clue using its numbers.
+Your phone becomes a scanner to investigate the next object.
+Your friend receives a different clue—you have to cooperate.
+
+The room becomes the game controller. Players answer, speak, scan objects, and submit photos to progress.
+What makes it interesting is that the AI must create a connected, solvable game: clues depend on each other, hints respond to actual progress, and the ending follows your choices.
+You’d build:
+- Room understanding: identify usable objects from uploaded photos, with user confirmation.
+- Puzzle generation: create structured clues and solutions, then validate their dependencies.
+- Game engine: track inventory, unlocked clues, timers, and player actions.
+- Live multiplayer: different clues on different devices.
+- Voice and visuals: a narrator, character messages, and themed screens.
+First version: one room, five confirmed objects, three players maximum, and a 15-minute mystery. Use proven puzzle templates with AI-generated stories and object mappings so the game stays solvable. Verify answers through codes and explicit actions before adding visual verification.
+This is a full-stack product you can build with existing models. The engineering challenge is making the experience coherent, reliable, and fun.
+Your demo is friends actually playing a game your app created from your room.
