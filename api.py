@@ -252,11 +252,23 @@ async def list_threads():
     return {"threads": thread_store.list_threads()}
 
 @app.get("/api/threads/{thread_id}")
-async def get_thread(thread_id: str):
+async def get_thread(thread_id: str, dev_mode: bool = False):
     """Get complete conversation thread with messages."""
     thread = thread_store.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
+    if not dev_mode and thread.get("messages"):
+        sanitized_messages = []
+        for msg in thread["messages"]:
+            if msg.get("role") == "assistant" and (msg.get("isAbstained") or not msg.get("answerGrounded")):
+                sanitized_msg = dict(msg)
+                sanitized_msg["ollamaStream"] = "[Worker output redacted: grounding validation failed closed.]"
+                sanitized_msg["groqStream"] = "[Worker output redacted: grounding validation failed closed.]"
+                sanitized_messages.append(sanitized_msg)
+            else:
+                sanitized_messages.append(msg)
+        thread = dict(thread)
+        thread["messages"] = sanitized_messages
     return thread
 
 @app.post("/api/threads")
@@ -412,6 +424,15 @@ async def stream_query(payload: QueryRequest):
                 session_state["token_count"] = token_count
                 session_state["was_trimmed"] = was_trimmed
                 
+                is_grounded = bool(data.get("answer_grounded", False)) and not bool(data.get("is_abstained", False))
+
+                if not is_grounded and not payload.dev_mode:
+                    safe_ollama_output = "[Worker output redacted: grounding validation failed closed.]"
+                    safe_groq_output = "[Worker output redacted: grounding validation failed closed.]"
+                else:
+                    safe_ollama_output = data.get("ollama_output", "")
+                    safe_groq_output = data.get("groq_output", "")
+
                 # Persist turn to thread_store
                 user_msg_entry = {
                     "id": f"user-{int(time.time()*1000)}",
@@ -424,8 +445,8 @@ async def stream_query(payload: QueryRequest):
                     "role": "assistant",
                     "content": data.get("final_response", ""),
                     "sources": data.get("retrieved_docs") or graph_retrieved_docs,
-                    "ollamaStream": data.get("ollama_output", ""),
-                    "groqStream": data.get("groq_output", ""),
+                    "ollamaStream": safe_ollama_output,
+                    "groqStream": safe_groq_output,
                     "arbiterDebate": data.get("arbiter_debate", ""),
                     "evidenceAvailable": data.get("evidence_available", False),
                     "evidenceReason": data.get("evidence_reason", ""),
@@ -450,8 +471,8 @@ async def stream_query(payload: QueryRequest):
                 payload_out = {
                     "final_response": data.get("final_response", ""),
                     "arbiter_debate": data.get("arbiter_debate", ""),
-                    "ollama_output": data.get("ollama_output", ""),
-                    "groq_output": data.get("groq_output", ""),
+                    "ollama_output": safe_ollama_output,
+                    "groq_output": safe_groq_output,
                     "evidence_available": data.get("evidence_available", False),
                     "evidence_reason": data.get("evidence_reason", ""),
                     "answer_grounded": data.get("answer_grounded", False),

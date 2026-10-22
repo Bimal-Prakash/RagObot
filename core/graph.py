@@ -135,6 +135,23 @@ def set_stream_listeners(
 # Evaluators: Evidence Availability & Grounding Verification (Fail-Closed)
 # ---------------------------------------------------------------------------
 
+def sanitize_untrusted_text(text: str) -> str:
+    """
+    Sanitizes untrusted document text to prevent prompt injection or XML tag escaping.
+    Neutralizes delimiter breakouts and common system instruction override prefixes.
+    """
+    if not text:
+        return ""
+    # Neutralize closing and opening boundary tags
+    clean = text.replace("</untrusted_source_evidence>", "&lt;/untrusted_source_evidence&gt;")
+    clean = clean.replace("<untrusted_source_evidence>", "&lt;untrusted_source_evidence&gt;")
+    clean = clean.replace("=== AGENT DEBATE", "[SAN_AGENT_DEBATE]")
+    clean = clean.replace("=== FINAL CONSENSUS", "[SAN_FINAL_CONSENSUS]")
+    clean = re.sub(r"\bSTATUS:\s*(FULLY_SUPPORTED|PARTIALLY_SUPPORTED|REJECTED)\b", r"STATUS_[DOC]: \1", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"\bVERDICT:\s*(YES|NO)\b", r"VERDICT_[DOC]: \1", clean, flags=re.IGNORECASE)
+    return clean
+
+
 async def assess_evidence_relevance(
     query: str,
     retrieved_docs: list[dict[str, Any]],
@@ -144,7 +161,7 @@ async def assess_evidence_relevance(
     """
     Evaluates Decision 1: 'Relevant evidence available?'
     Checks if retrieved ChromaDB chunks contain sufficient evidence for the specific query.
-    Fails closed on timeout, malformed output, or exception.
+    Fails closed on timeout, malformed output, exception, or contradictory verdicts.
     """
     if not retrieved_docs:
         return False, "Empty retrieval results from knowledge base."
@@ -155,7 +172,7 @@ async def assess_evidence_relevance(
     if max_score < 0.45:
         return False, f"Semantic similarity score ({max_score:.2f}) is below evidence threshold (0.45)."
 
-    snippets = "\n".join([f"- {d.get('breadcrumb', 'General')}: {d.get('content', '')[:220]}" for d in retrieved_docs])
+    snippets = "\n".join([f"- {d.get('breadcrumb', 'General')}: {sanitize_untrusted_text(d.get('content', ''))[:220]}" for d in retrieved_docs])
     prompt = RELEVANCE_EVALUATOR_PROMPT.format(query=query, snippets=snippets)
 
     # 1. Try cloud model first (Groq) if available
@@ -165,21 +182,23 @@ async def assess_evidence_relevance(
             res = await asyncio.wait_for(llm.ainvoke(prompt), timeout=5.0)
             text = str(res.content).strip()
             
-            is_yes = bool(re.search(r"VERDICT:\s*YES\b", text, re.IGNORECASE))
-            is_no = bool(re.search(r"VERDICT:\s*NO\b", text, re.IGNORECASE))
+            is_yes = bool(re.search(r"\bVERDICT:\s*YES\b", text, re.IGNORECASE))
+            is_no = bool(re.search(r"\bVERDICT:\s*NO\b", text, re.IGNORECASE))
             reason_match = re.search(r"REASON:\s*(.+)", text, re.IGNORECASE)
             reason = reason_match.group(1).strip() if reason_match else text
 
-            if is_yes:
+            # Strict verdict enforcement: exactly one valid verdict required
+            if is_yes and not is_no:
                 return True, reason
-            elif is_no:
+            elif is_no and not is_yes:
                 return False, reason
+            elif is_yes and is_no:
+                return False, f"Relevance evaluator produced contradictory verdicts (both YES and NO): {text[:100]}"
             else:
-                # Malformed output -> Fail closed
                 return False, f"Relevance evaluator output malformed: {text[:100]}"
         except asyncio.TimeoutError:
             return False, "Relevance evaluator timed out (failed closed)."
-        except Exception as e:
+        except Exception:
             # Fall through to local model if available
             pass
 
@@ -189,15 +208,18 @@ async def assess_evidence_relevance(
         res = await asyncio.wait_for(llm.ainvoke(prompt), timeout=8.0)
         text = str(res.content).strip()
         
-        is_yes = bool(re.search(r"VERDICT:\s*YES\b", text, re.IGNORECASE))
-        is_no = bool(re.search(r"VERDICT:\s*NO\b", text, re.IGNORECASE))
+        is_yes = bool(re.search(r"\bVERDICT:\s*YES\b", text, re.IGNORECASE))
+        is_no = bool(re.search(r"\bVERDICT:\s*NO\b", text, re.IGNORECASE))
         reason_match = re.search(r"REASON:\s*(.+)", text, re.IGNORECASE)
         reason = reason_match.group(1).strip() if reason_match else text
 
-        if is_yes:
+        # Strict verdict enforcement: exactly one valid verdict required
+        if is_yes and not is_no:
             return True, reason
-        elif is_no:
+        elif is_no and not is_yes:
             return False, reason
+        elif is_yes and is_no:
+            return False, f"Relevance evaluator produced contradictory verdicts (both YES and NO): {text[:100]}"
         else:
             return False, f"Relevance evaluator output malformed: {text[:100]}"
     except asyncio.TimeoutError:
@@ -209,9 +231,14 @@ async def assess_evidence_relevance(
 
 def validate_claims_deterministic(candidate: str, retrieved_docs: list[dict[str, Any]]) -> tuple[bool, str]:
     """
-    Deterministic verification layer against hallucinated numbers, dates, and metrics.
-    Ensures that numeric claims (years, calorie counts, measurements, percentages)
-    actually appear in at least one retrieved source document.
+    Focused heuristic guardrail against hallucinated numbers, dates, and metrics.
+    Ensures that numeric tokens (years, measurements, percentages) appear as discrete
+    tokens in at least one retrieved source document.
+    
+    LIMITATION NOTE:
+    This is a narrow syntactic guardrail, NOT proof of full semantic claim entailment.
+    It catches invented numbers/metrics, while semantic grounding is performed by the LLM
+    validator and secondary revalidation layers.
     """
     if not candidate or not retrieved_docs:
         return False, "Missing candidate answer or source documentation."
@@ -225,7 +252,8 @@ def validate_claims_deterministic(candidate: str, retrieved_docs: list[dict[str,
         num_part = re.match(r"\d+", m)
         if num_part:
             raw_num = num_part.group(0)
-            if raw_num not in all_source_lower:
+            # Ensure number is matched on discrete word boundary rather than arbitrary substring
+            if not re.search(r"\b" + re.escape(raw_num) + r"\b", all_source_lower):
                 return False, f"Candidate mentions metric/number '{m}' not supported in source documents."
 
     return True, "Deterministic metric verification passed."
@@ -246,7 +274,7 @@ async def _revalidate_pruned_answer(
     if not det_ok:
         return False, f"Deterministic recheck failed: {det_reason}", ""
 
-    context_text = "\n\n".join(doc.get("formatted", "") for doc in retrieved_docs)
+    context_text = "\n\n".join(sanitize_untrusted_text(doc.get("formatted", "")) for doc in retrieved_docs)
     prompt = f"""You are a strict, independent secondary factual grounding re-validator.
 A candidate answer was pruned to remove unsupported claims.
 Verify if EVERY SINGLE remaining claim in this pruned text is now 100% directly entailed by the source documents.
@@ -286,11 +314,17 @@ REASON: <concise summary>"""
         except Exception:
             return False, "Secondary revalidation evaluator unavailable; failed closed.", ""
 
-    status_match = re.search(r"STATUS:\s*(FULLY_SUPPORTED|REJECTED)", raw_response, re.IGNORECASE)
+    status_matches = re.findall(r"\bSTATUS:\s*(FULLY_SUPPORTED|REJECTED)\b", raw_response, re.IGNORECASE)
     reason_match = re.search(r"REASON:\s*(.+)", raw_response, re.IGNORECASE)
     reason = reason_match.group(1).strip() if reason_match else raw_response[:100]
 
-    if status_match and status_match.group(1).upper() == "FULLY_SUPPORTED":
+    # Enforce strictly one valid unambiguous status
+    if len(status_matches) == 0:
+        return False, "Secondary revalidation output malformed without valid STATUS; failed closed.", ""
+    elif len(status_matches) > 1:
+        return False, f"Secondary revalidation output ambiguous or contradictory ({len(status_matches)} status tags found); failed closed.", ""
+
+    if status_matches[0].upper() == "FULLY_SUPPORTED":
         return True, reason, pruned_answer
 
     return False, f"Secondary revalidation rejected pruned text ({reason}); failed closed.", ""
@@ -307,12 +341,12 @@ async def assess_answer_grounding(
     Evaluates Decision 2: 'Answer grounded in sources?'
     Checks each material claim for explicit source entailment.
     Returns: (is_grounded, grounding_reason, grounded_answer)
-    Fails closed on timeout, malformed output, or exception.
+    Fails closed on timeout, malformed output, exception, or contradictory statuses.
     """
     if not verdict or not retrieved_docs:
         return False, "Missing candidate answer or source documentation.", ""
 
-    context_text = "\n\n".join(doc.get("formatted", "") for doc in retrieved_docs)
+    context_text = "\n\n".join(sanitize_untrusted_text(doc.get("formatted", "")) for doc in retrieved_docs)
     prompt = GROUNDING_EVALUATOR_PROMPT.format(
         context_text=context_text,
         query=query,
@@ -342,16 +376,17 @@ async def assess_answer_grounding(
         except Exception as e:
             return False, f"Grounding validator exception ({e}); failed closed.", ""
 
-    # Parse response
-    status_match = re.search(r"STATUS:\s*(FULLY_SUPPORTED|PARTIALLY_SUPPORTED|REJECTED)", raw_response, re.IGNORECASE)
+    # Parse response - require exactly one valid status tag
+    status_matches = re.findall(r"\bSTATUS:\s*(FULLY_SUPPORTED|PARTIALLY_SUPPORTED|REJECTED)\b", raw_response, re.IGNORECASE)
     reason_match = re.search(r"REASON:\s*(.+?)(?=\nGROUNDED_ANSWER:|\Z)", raw_response, re.IGNORECASE | re.DOTALL)
     answer_match = re.search(r"GROUNDED_ANSWER:\s*(.+)", raw_response, re.IGNORECASE | re.DOTALL)
 
-    if not status_match:
-        # Malformed output -> Fail closed
+    if len(status_matches) == 0:
         return False, "Grounding validator produced malformed output without valid STATUS.", ""
+    elif len(status_matches) > 1:
+        return False, f"Grounding validator produced ambiguous or contradictory statuses ({len(status_matches)} statuses found); failed closed.", ""
 
-    status = status_match.group(1).upper()
+    status = status_matches[0].upper()
     reason = reason_match.group(1).strip() if reason_match else "Claim evaluation complete."
     grounded_answer = answer_match.group(1).strip() if answer_match else ""
 
@@ -730,7 +765,7 @@ async def consensus_arbiter_node(state: RagObotState) -> dict[str, Any]:
     cloud_model = state.get("cloud_model") or config.GROQ_MODEL
     local_model = state.get("local_model") or config.OLLAMA_MODEL
     
-    context_text = "\n\n".join(doc.get("formatted", "") for doc in retrieved_docs)
+    context_text = "\n\n".join(sanitize_untrusted_text(doc.get("formatted", "")) for doc in retrieved_docs)
     
     # Determine valid candidate perspectives
     is_local_bypassed = not ollama_out or ollama_out.startswith("Ollama execution bypassed")
@@ -758,7 +793,9 @@ async def consensus_arbiter_node(state: RagObotState) -> dict[str, Any]:
     target_section = f"\nTARGET FOCUS DOCUMENT:\n{target_doc} (User query asks specifically about this document)\n" if target_doc else ""
 
     arbiter_input = f"""SOURCE CHROMADB DOCUMENTATION (VERIFIED EVIDENCE):
+<untrusted_source_evidence>
 {context_text}
+</untrusted_source_evidence>
 {history_section}{target_section}
 USER QUERY:
 {query}
