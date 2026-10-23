@@ -27,10 +27,10 @@ app = FastAPI(
     description="Hyper-concurrent LangGraph multi-agent RAG backend with SSE streaming"
 )
 
-# Enable CORS for React dev server (e.g., http://localhost:5173) and local access
+# Enable CORS with explicit origin allowlist from configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=config.ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -52,15 +52,20 @@ def is_dev_authorized(
 ) -> bool:
     """
     Validates whether developer diagnostic mode is authorized on the backend.
-    A client-supplied boolean (dev_mode: true) does not grant access on its own unless
-    ALLOW_UNAUTHENTICATED_DEV_MODE is explicitly enabled (e.g. offline dev).
-    In all other configurations, a configured DEV_MODE_KEY must match supplied_key or X-Dev-Key header.
+    - If requested_dev_mode is False: returns False.
+    - If ENVIRONMENT is 'production': strictly enforces DEV_MODE_KEY verification,
+      ignoring ALLOW_UNAUTHENTICATED_DEV_MODE to prevent production bypass.
+    - If ENVIRONMENT is non-production AND ALLOW_UNAUTHENTICATED_DEV_MODE is True: returns True.
+    - Otherwise: requires configured DEV_MODE_KEY matching supplied_key or X-Dev-Key header.
     Fails closed if DEV_MODE_KEY is unset and unauthenticated access is disallowed.
     """
     if not requested_dev_mode:
         return False
 
-    if config.ALLOW_UNAUTHENTICATED_DEV_MODE:
+    is_production = str(getattr(config, "ENVIRONMENT", "development")).strip().lower() == "production"
+
+    # Only permit unauthenticated dev mode outside of production environments
+    if not is_production and getattr(config, "ALLOW_UNAUTHENTICATED_DEV_MODE", False):
         return True
 
     configured_key = (config.DEV_MODE_KEY or "").strip()
@@ -283,8 +288,7 @@ async def list_threads():
 async def get_thread(
     thread_id: str,
     request: Request,
-    dev_mode: bool = False,
-    dev_key: Optional[str] = None
+    dev_mode: bool = False
 ):
     """Get complete conversation thread with messages."""
     thread = thread_store.get_thread(thread_id)
@@ -292,7 +296,12 @@ async def get_thread(
         raise HTTPException(status_code=404, detail="Thread not found")
         
     header_key = request.headers.get("x-dev-key")
-    effective_dev_mode = is_dev_authorized(dev_mode, dev_key, header_key)
+    if not header_key and request.headers.get("authorization"):
+        auth_hdr = request.headers.get("authorization", "")
+        if auth_hdr.startswith("Bearer "):
+            header_key = auth_hdr[7:].strip()
+
+    effective_dev_mode = is_dev_authorized(dev_mode, header_key=header_key)
 
     if not effective_dev_mode and thread.get("messages"):
         sanitized_messages = []
@@ -485,8 +494,8 @@ async def stream_query(payload: QueryRequest, request: Request):
                     "role": "assistant",
                     "content": data.get("final_response", ""),
                     "sources": data.get("retrieved_docs") or graph_retrieved_docs,
-                    "ollamaStream": safe_ollama_output,
-                    "groqStream": safe_groq_output,
+                    "ollamaStream": data.get("ollama_output", ""),
+                    "groqStream": data.get("groq_output", ""),
                     "arbiterDebate": data.get("arbiter_debate", ""),
                     "evidenceAvailable": data.get("evidence_available", False),
                     "evidenceReason": data.get("evidence_reason", ""),

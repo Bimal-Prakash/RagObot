@@ -4,7 +4,7 @@ Structured schema validation powered by Pydantic v2 BaseSettings.
 Loads environment variables from .env or system environment with strict typing.
 """
 from pathlib import Path
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class AppConfig(BaseSettings):
@@ -14,7 +14,12 @@ class AppConfig(BaseSettings):
         extra="ignore"
     )
 
-    # Core Directories
+    # Core Directories & Environment
+    ENVIRONMENT: str = Field(default="development", description="Deployment environment ('development', 'staging', 'production')")
+    ALLOWED_ORIGINS: list[str] = Field(
+        default=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000", "http://127.0.0.1:3000"],
+        description="Allowed CORS origins list"
+    )
     BASE_DIR: Path = Path(__file__).resolve().parent
     DATA_DIR: Path = Path("./data")
     CHROMA_DIR: Path = Path("./data/chroma_db")
@@ -43,10 +48,22 @@ class AppConfig(BaseSettings):
     TTS_RATE: int = Field(default=0, description="Speech rate offset (-10 to +10)")
     TTS_VOLUME: int = Field(default=100, description="Speech volume (0 to 100)")
 
+    @model_validator(mode="after")
+    def validate_production_security(self) -> 'AppConfig':
+        """Enforces that unauthenticated developer mode cannot be enabled in production deployments."""
+        if str(self.ENVIRONMENT).strip().lower() == "production":
+            if self.ALLOW_UNAUTHENTICATED_DEV_MODE:
+                raise ValueError(
+                    "CRITICAL SECURITY CONFIGURATION ERROR: ALLOW_UNAUTHENTICATED_DEV_MODE cannot be True in production!"
+                )
+        return self
+
 # Global Singleton Instance
 settings = AppConfig()
 
 # Clean module-level exports for backward compatibility across all imports
+ENVIRONMENT = settings.ENVIRONMENT
+ALLOWED_ORIGINS = settings.ALLOWED_ORIGINS
 BASE_DIR = settings.BASE_DIR
 DATA_DIR = settings.DATA_DIR
 CHROMA_DIR = settings.CHROMA_DIR
