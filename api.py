@@ -5,6 +5,7 @@ import urllib.request
 import shutil
 import os
 import time
+import hmac
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
@@ -44,6 +45,32 @@ session_state: dict[str, Any] = {
     "history": []
 }
 
+def is_dev_authorized(
+    requested_dev_mode: bool,
+    supplied_key: Optional[str] = None,
+    header_key: Optional[str] = None
+) -> bool:
+    """
+    Validates whether developer diagnostic mode is authorized on the backend.
+    A client-supplied boolean (dev_mode: true) does not grant access on its own unless
+    ALLOW_UNAUTHENTICATED_DEV_MODE is explicitly enabled (e.g. offline dev).
+    In all other configurations, a configured DEV_MODE_KEY must match supplied_key or X-Dev-Key header.
+    Fails closed if DEV_MODE_KEY is unset and unauthenticated access is disallowed.
+    """
+    if not requested_dev_mode:
+        return False
+
+    if config.ALLOW_UNAUTHENTICATED_DEV_MODE:
+        return True
+
+    configured_key = (config.DEV_MODE_KEY or "").strip()
+    if not configured_key:
+        # Fail closed: No authorization key configured and unauthenticated dev mode is disabled.
+        return False
+
+    token = (supplied_key or header_key or "").strip()
+    return hmac.compare_digest(token, configured_key)
+
 class QueryRequest(BaseModel):
     query: str
     thread_id: str | None = None
@@ -52,7 +79,8 @@ class QueryRequest(BaseModel):
     model_mode: str = "dual"  # "dual", "local", "cloud"
     local_model: str | None = None
     cloud_model: str | None = None
-    dev_mode: bool = False  # If True, streams raw unverified worker tokens to developer UI; defaults to False (fail-closed)
+    dev_mode: bool = False  # If True, requests developer diagnostic mode; must be authorized by backend
+    dev_key: str | None = None  # Optional secret developer authorization key
 
 class GroqSettingsRequest(BaseModel):
     api_key: str | None = None
@@ -252,12 +280,21 @@ async def list_threads():
     return {"threads": thread_store.list_threads()}
 
 @app.get("/api/threads/{thread_id}")
-async def get_thread(thread_id: str, dev_mode: bool = False):
+async def get_thread(
+    thread_id: str,
+    request: Request,
+    dev_mode: bool = False,
+    dev_key: Optional[str] = None
+):
     """Get complete conversation thread with messages."""
     thread = thread_store.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
-    if not dev_mode and thread.get("messages"):
+        
+    header_key = request.headers.get("x-dev-key")
+    effective_dev_mode = is_dev_authorized(dev_mode, dev_key, header_key)
+
+    if not effective_dev_mode and thread.get("messages"):
         sanitized_messages = []
         for msg in thread["messages"]:
             if msg.get("role") == "assistant" and (msg.get("isAbstained") or not msg.get("answerGrounded")):
@@ -308,7 +345,7 @@ async def reset_session():
     return {"status": "reset", "thread_id": new_thread["id"], "thread": new_thread}
 
 @app.post("/api/query")
-async def stream_query(payload: QueryRequest):
+async def stream_query(payload: QueryRequest, request: Request):
     """
     Executes LangGraph query and streams events to React via Server-Sent Events (SSE).
     Streams:
@@ -321,6 +358,9 @@ async def stream_query(payload: QueryRequest):
     thread_id = payload.thread_id or session_state["thread_id"]
     query = payload.query.strip()
     
+    header_dev_key = request.headers.get("x-dev-key")
+    effective_dev_mode = is_dev_authorized(payload.dev_mode, payload.dev_key, header_dev_key)
+
     # Ensure thread exists in persistent storage
     thread_record = thread_store.get_thread(thread_id)
     if not thread_record:
@@ -404,12 +444,12 @@ async def stream_query(payload: QueryRequest):
             elif event_type == "stage":
                 yield f"event: stage\ndata: {json.dumps(data)}\n\n"
             elif event_type == "ollama_token":
-                # Only stream raw unverified tokens if developer mode is explicitly enabled
-                if payload.dev_mode:
+                # Only stream raw unverified tokens if developer mode is explicitly authorized on backend
+                if effective_dev_mode:
                     yield f"event: ollama_token\ndata: {json.dumps({'token': data})}\n\n"
             elif event_type == "groq_token":
-                # Only stream raw unverified tokens if developer mode is explicitly enabled
-                if payload.dev_mode:
+                # Only stream raw unverified tokens if developer mode is explicitly authorized on backend
+                if effective_dev_mode:
                     yield f"event: groq_token\ndata: {json.dumps({'token': data})}\n\n"
             elif event_type == "evidence_status":
                 yield f"event: evidence_status\ndata: {json.dumps(data)}\n\n"
@@ -426,7 +466,7 @@ async def stream_query(payload: QueryRequest):
                 
                 is_grounded = bool(data.get("answer_grounded", False)) and not bool(data.get("is_abstained", False))
 
-                if not is_grounded and not payload.dev_mode:
+                if not is_grounded and not effective_dev_mode:
                     safe_ollama_output = "[Worker output redacted: grounding validation failed closed.]"
                     safe_groq_output = "[Worker output redacted: grounding validation failed closed.]"
                 else:

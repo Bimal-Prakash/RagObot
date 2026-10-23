@@ -33,6 +33,10 @@ class AppConfig(BaseSettings):
     MAX_CONTEXT_TOKENS: int = Field(default=2000, description="Rolling context window token limit")
     TOP_K_CHUNKS: int = Field(default=3, description="Semantic chunks retrieved per user query")
 
+    # Security & Developer Access Control
+    DEV_MODE_KEY: str = Field(default="", description="Secret key for developer diagnostic access")
+    ALLOW_UNAUTHENTICATED_DEV_MODE: bool = Field(default=False, description="Allow dev_mode without key for local development")
+
     # Native Speech Pipeline (Neural TTS with SAPI fallback)
     TTS_ENABLED: bool = Field(default=True, description="Enable local speech synthesis")
     TTS_VOICE: str = Field(default="en-US-JennyNeural", description="Neural Voice (en-US-JennyNeural, en-US-GuyNeural, en-US-AriaNeural)")
@@ -54,6 +58,8 @@ EMBEDDING_MODEL = settings.EMBEDDING_MODEL
 ARBITER_ENGINE = settings.ARBITER_ENGINE
 MAX_CONTEXT_TOKENS = settings.MAX_CONTEXT_TOKENS
 TOP_K_CHUNKS = settings.TOP_K_CHUNKS
+DEV_MODE_KEY = settings.DEV_MODE_KEY
+ALLOW_UNAUTHENTICATED_DEV_MODE = settings.ALLOW_UNAUTHENTICATED_DEV_MODE
 TTS_ENABLED = settings.TTS_ENABLED
 TTS_VOICE = settings.TTS_VOICE
 TTS_RATE = settings.TTS_RATE
