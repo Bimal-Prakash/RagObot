@@ -12,7 +12,7 @@ from typing import Any, AsyncGenerator, Optional
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from langchain_core.messages import HumanMessage, AIMessage
 
 import config
@@ -45,18 +45,32 @@ session_state: dict[str, Any] = {
     "history": []
 }
 
+def extract_dev_key_from_headers(request: Request) -> Optional[str]:
+    """
+    Extracts developer secret key exclusively from standard HTTP headers.
+    Accepted headers:
+      - X-Dev-Key: <secret>
+      - Authorization: Bearer <secret>
+    Query parameters and JSON request body keys are strictly rejected.
+    """
+    header_key = request.headers.get("x-dev-key")
+    if not header_key and request.headers.get("authorization"):
+        auth_hdr = request.headers.get("authorization", "").strip()
+        if auth_hdr.startswith("Bearer "):
+            header_key = auth_hdr[7:].strip()
+    return header_key
+
 def is_dev_authorized(
     requested_dev_mode: bool,
-    supplied_key: Optional[str] = None,
     header_key: Optional[str] = None
 ) -> bool:
     """
     Validates whether developer diagnostic mode is authorized on the backend.
     - If requested_dev_mode is False: returns False.
-    - If ENVIRONMENT is 'production': strictly enforces DEV_MODE_KEY verification,
+    - If ENVIRONMENT is 'production': strictly enforces DEV_MODE_KEY verification via header,
       ignoring ALLOW_UNAUTHENTICATED_DEV_MODE to prevent production bypass.
     - If ENVIRONMENT is non-production AND ALLOW_UNAUTHENTICATED_DEV_MODE is True: returns True.
-    - Otherwise: requires configured DEV_MODE_KEY matching supplied_key or X-Dev-Key header.
+    - Otherwise: requires configured DEV_MODE_KEY matching header_key (X-Dev-Key or Authorization: Bearer).
     Fails closed if DEV_MODE_KEY is unset and unauthenticated access is disallowed.
     """
     if not requested_dev_mode:
@@ -73,10 +87,61 @@ def is_dev_authorized(
         # Fail closed: No authorization key configured and unauthenticated dev mode is disabled.
         return False
 
-    token = (supplied_key or header_key or "").strip()
+    token = (header_key or "").strip()
     return hmac.compare_digest(token, configured_key)
 
+def format_message_for_client(msg: dict[str, Any], is_authorized_dev: bool) -> dict[str, Any]:
+    """
+    Applies strict allowlist schema filtering to conversation messages.
+    - Public mode (is_authorized_dev=False):
+      Returns ONLY public fields (id, role, content, timestamp, sources, evidenceAvailable, answerGrounded, isAbstained).
+      Internal diagnostic fields (ollamaStream, groqStream, arbiterDebate, groundedAnswer, evidenceReason,
+      groundingReason, abstentionReason, tokenCount, wasTrimmed) are completely excluded from the response.
+    - Developer mode (is_authorized_dev=True):
+      Returns all message fields including raw worker drafts, debate logs, and evaluation metrics.
+    """
+    if is_authorized_dev:
+        return dict(msg)
+
+    role = msg.get("role")
+    filtered: dict[str, Any] = {
+        "id": msg.get("id", ""),
+        "role": role,
+        "content": msg.get("content", ""),
+        "timestamp": msg.get("timestamp", "")
+    }
+    if role == "assistant":
+        filtered["sources"] = msg.get("sources", [])
+        filtered["evidenceAvailable"] = bool(msg.get("evidenceAvailable", False))
+        filtered["answerGrounded"] = bool(msg.get("answerGrounded", False))
+        filtered["isAbstained"] = bool(msg.get("isAbstained", False))
+        if "targetDoc" in msg:
+            filtered["targetDoc"] = msg["targetDoc"]
+    return filtered
+
+def format_thread_for_client(thread: dict[str, Any], is_authorized_dev: bool) -> dict[str, Any]:
+    """
+    Formats thread response, enforcing strict separation of public fields from internal diagnostics.
+    """
+    raw_messages = thread.get("messages", [])
+    filtered_messages = [format_message_for_client(m, is_authorized_dev) for m in raw_messages]
+
+    formatted = {
+        "id": thread.get("id"),
+        "title": thread.get("title", "New Chat"),
+        "created_at": thread.get("created_at"),
+        "updated_at": thread.get("updated_at"),
+        "last_uploaded_doc": thread.get("last_uploaded_doc"),
+        "token_count": thread.get("token_count", 0),
+        "was_trimmed": thread.get("was_trimmed", False),
+        "is_diagnostic": is_authorized_dev,
+        "messages": filtered_messages
+    }
+    return formatted
+
 class QueryRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     query: str
     thread_id: str | None = None
     uploaded_doc: str | None = None
@@ -84,8 +149,7 @@ class QueryRequest(BaseModel):
     model_mode: str = "dual"  # "dual", "local", "cloud"
     local_model: str | None = None
     cloud_model: str | None = None
-    dev_mode: bool = False  # If True, requests developer diagnostic mode; must be authorized by backend
-    dev_key: str | None = None  # Optional secret developer authorization key
+    dev_mode: bool = False  # If True, requests developer diagnostic mode; must be authorized by backend header
 
 class GroqSettingsRequest(BaseModel):
     api_key: str | None = None
@@ -290,32 +354,14 @@ async def get_thread(
     request: Request,
     dev_mode: bool = False
 ):
-    """Get complete conversation thread with messages."""
+    """Get complete conversation thread, strictly separating public schema from developer diagnostics."""
     thread = thread_store.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
         
-    header_key = request.headers.get("x-dev-key")
-    if not header_key and request.headers.get("authorization"):
-        auth_hdr = request.headers.get("authorization", "")
-        if auth_hdr.startswith("Bearer "):
-            header_key = auth_hdr[7:].strip()
-
+    header_key = extract_dev_key_from_headers(request)
     effective_dev_mode = is_dev_authorized(dev_mode, header_key=header_key)
-
-    if not effective_dev_mode and thread.get("messages"):
-        sanitized_messages = []
-        for msg in thread["messages"]:
-            if msg.get("role") == "assistant" and (msg.get("isAbstained") or not msg.get("answerGrounded")):
-                sanitized_msg = dict(msg)
-                sanitized_msg["ollamaStream"] = "[Worker output redacted: grounding validation failed closed.]"
-                sanitized_msg["groqStream"] = "[Worker output redacted: grounding validation failed closed.]"
-                sanitized_messages.append(sanitized_msg)
-            else:
-                sanitized_messages.append(msg)
-        thread = dict(thread)
-        thread["messages"] = sanitized_messages
-    return thread
+    return format_thread_for_client(thread, effective_dev_mode)
 
 @app.post("/api/threads")
 async def create_thread(req: Optional[CreateThreadRequest] = None):
@@ -359,16 +405,16 @@ async def stream_query(payload: QueryRequest, request: Request):
     Executes LangGraph query and streams events to React via Server-Sent Events (SSE).
     Streams:
       - 'docs': Retrieved markdown chunks
-      - 'ollama': Tokens from Ollama local worker
-      - 'groq': Tokens from Groq cloud worker
-      - 'consensus': Final synthesis from Arbiter
+      - 'ollama': Tokens from Ollama local worker (developer mode only)
+      - 'groq': Tokens from Groq cloud worker (developer mode only)
+      - 'consensus': Final synthesis from Arbiter (public response or diagnostic payload)
       - 'diagnostics': Token count and trim alert
     """
     thread_id = payload.thread_id or session_state["thread_id"]
     query = payload.query.strip()
     
-    header_dev_key = request.headers.get("x-dev-key")
-    effective_dev_mode = is_dev_authorized(payload.dev_mode, payload.dev_key, header_dev_key)
+    header_dev_key = extract_dev_key_from_headers(request)
+    effective_dev_mode = is_dev_authorized(payload.dev_mode, header_key=header_dev_key)
 
     # Ensure thread exists in persistent storage
     thread_record = thread_store.get_thread(thread_id)
@@ -461,9 +507,15 @@ async def stream_query(payload: QueryRequest, request: Request):
                 if effective_dev_mode:
                     yield f"event: groq_token\ndata: {json.dumps({'token': data})}\n\n"
             elif event_type == "evidence_status":
-                yield f"event: evidence_status\ndata: {json.dumps(data)}\n\n"
+                if effective_dev_mode:
+                    yield f"event: evidence_status\ndata: {json.dumps(data)}\n\n"
+                else:
+                    yield f"event: evidence_status\ndata: {json.dumps({'available': bool(data.get('available', False))})}\n\n"
             elif event_type == "validation_status":
-                yield f"event: validation_status\ndata: {json.dumps(data)}\n\n"
+                if effective_dev_mode:
+                    yield f"event: validation_status\ndata: {json.dumps(data)}\n\n"
+                else:
+                    yield f"event: validation_status\ndata: {json.dumps({'grounded': bool(data.get('grounded', False))})}\n\n"
             elif event_type == "graph_result":
                 if not graph_retrieved_docs and data.get("retrieved_docs"):
                     graph_retrieved_docs = data.get("retrieved_docs", [])
@@ -473,16 +525,7 @@ async def stream_query(payload: QueryRequest, request: Request):
                 session_state["token_count"] = token_count
                 session_state["was_trimmed"] = was_trimmed
                 
-                is_grounded = bool(data.get("answer_grounded", False)) and not bool(data.get("is_abstained", False))
-
-                if not is_grounded and not effective_dev_mode:
-                    safe_ollama_output = "[Worker output redacted: grounding validation failed closed.]"
-                    safe_groq_output = "[Worker output redacted: grounding validation failed closed.]"
-                else:
-                    safe_ollama_output = data.get("ollama_output", "")
-                    safe_groq_output = data.get("groq_output", "")
-
-                # Persist turn to thread_store
+                # Persist turn to server-side thread_store with all raw model metadata
                 user_msg_entry = {
                     "id": f"user-{int(time.time()*1000)}",
                     "role": "user",
@@ -517,25 +560,39 @@ async def stream_query(payload: QueryRequest, request: Request):
                     was_trimmed=was_trimmed
                 )
                 
-                payload_out = {
-                    "final_response": data.get("final_response", ""),
-                    "arbiter_debate": data.get("arbiter_debate", ""),
-                    "ollama_output": safe_ollama_output,
-                    "groq_output": safe_groq_output,
-                    "evidence_available": data.get("evidence_available", False),
-                    "evidence_reason": data.get("evidence_reason", ""),
-                    "answer_grounded": data.get("answer_grounded", False),
-                    "grounding_reason": data.get("grounding_reason", ""),
-                    "grounded_answer": data.get("grounded_answer", ""),
-                    "is_abstained": data.get("is_abstained", False),
-                    "abstention_reason": data.get("abstention_reason", ""),
-                    "token_count": token_count,
-                    "was_trimmed": was_trimmed,
-                    "thread_id": thread_id,
-                    "thread_title": saved_thread.get("title", "New Chat"),
-                    "uploaded_doc": effective_uploaded_doc,
-                    "target_doc": data.get("target_doc", "")
-                }
+                if not effective_dev_mode:
+                    # Public consensus schema: strictly omit worker drafts, CoT reasoning, and debate resolution notes
+                    payload_out = {
+                        "final_response": data.get("final_response", ""),
+                        "evidence_available": data.get("evidence_available", False),
+                        "answer_grounded": data.get("answer_grounded", False),
+                        "is_abstained": data.get("is_abstained", False),
+                        "thread_id": thread_id,
+                        "thread_title": saved_thread.get("title", "New Chat"),
+                        "uploaded_doc": effective_uploaded_doc,
+                        "target_doc": data.get("target_doc", "")
+                    }
+                else:
+                    # Diagnostic schema: provide full transparency for authorized developer requests
+                    payload_out = {
+                        "final_response": data.get("final_response", ""),
+                        "arbiter_debate": data.get("arbiter_debate", ""),
+                        "ollama_output": data.get("ollama_output", ""),
+                        "groq_output": data.get("groq_output", ""),
+                        "evidence_available": data.get("evidence_available", False),
+                        "evidence_reason": data.get("evidence_reason", ""),
+                        "answer_grounded": data.get("answer_grounded", False),
+                        "grounding_reason": data.get("grounding_reason", ""),
+                        "grounded_answer": data.get("grounded_answer", ""),
+                        "is_abstained": data.get("is_abstained", False),
+                        "abstention_reason": data.get("abstention_reason", ""),
+                        "token_count": token_count,
+                        "was_trimmed": was_trimmed,
+                        "thread_id": thread_id,
+                        "thread_title": saved_thread.get("title", "New Chat"),
+                        "uploaded_doc": effective_uploaded_doc,
+                        "target_doc": data.get("target_doc", "")
+                    }
                 yield f"event: consensus\ndata: {json.dumps(payload_out)}\n\n"
             elif event_type == "error":
                 yield f"event: error\ndata: {json.dumps({'error': data})}\n\n"
