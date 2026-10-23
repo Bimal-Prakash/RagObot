@@ -12,6 +12,9 @@
 *[dD]iet [pP]lan*
 *[rR]esume*
 data/threads/
+data/uploads/
+scratch/
+plan.txt
 
 # -------------------------------------------------------------------
 # Python Virtual Environments & Bytecode

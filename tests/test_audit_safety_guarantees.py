@@ -967,6 +967,128 @@ class TestAuditSafetyGuarantees(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ok_invalid)
         self.assertIn("1999", reason)
 
+    # -----------------------------------------------------------------------
+    # 24. Upload Path Traversal, Extension, and Size Limits
+    # -----------------------------------------------------------------------
+    async def test_24_path_traversal_and_malicious_upload_rejected(self):
+        """Verify upload endpoint rejects unsafe extensions, directory traversal, and oversize files."""
+        import config
+        from api import app, MAX_UPLOAD_SIZE_BYTES
+        from httpx import AsyncClient, ASGITransport
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            # 1. Unsafe extension (.exe, .py, .sh) must return 400
+            files = {"file": ("malicious.exe", b"binary executable content", "application/octet-stream")}
+            res = await client.post("/api/upload", files=files)
+            self.assertEqual(res.status_code, 400)
+            self.assertIn("Unsupported file type", res.json()["error"])
+
+            # 2. Directory traversal attempt in filename must be stripped to basename
+            safe_basename = "test_traversal_safe.md"
+            files_traversal = {"file": (f"../../{safe_basename}", b"# Test safe", "text/markdown")}
+            res_traversal = await client.post("/api/upload", files=files_traversal)
+            self.assertEqual(res_traversal.status_code, 200)
+            self.assertEqual(res_traversal.json()["filename"], safe_basename)
+            # Verify file exists strictly within DATA_DIR
+            self.assertTrue((config.DATA_DIR / safe_basename).exists())
+            # Cleanup test file
+            if (config.DATA_DIR / safe_basename).exists():
+                (config.DATA_DIR / safe_basename).unlink()
+
+            # 3. Oversized file exceeding 25MB must return 413
+            oversize_bytes = b"A" * (MAX_UPLOAD_SIZE_BYTES + 1024)
+            files_oversize = {"file": ("huge.txt", oversize_bytes, "text/plain")}
+            res_oversize = await client.post("/api/upload", files=files_oversize)
+            self.assertEqual(res_oversize.status_code, 413)
+            self.assertIn("maximum allowed size", res_oversize.json()["error"])
+
+    # -----------------------------------------------------------------------
+    # 25. Thread ID Directory Traversal & Injection Hardening
+    # -----------------------------------------------------------------------
+    async def test_25_invalid_and_traversal_thread_ids_rejected(self):
+        """Thread operations must fail-closed on malformed or directory traversal IDs."""
+        from api import app
+        from core.thread_store import thread_store
+        from httpx import AsyncClient, ASGITransport
+
+        # ThreadStore direct method checks
+        self.assertIsNone(thread_store.get_thread("../malicious"))
+        self.assertFalse(thread_store.delete_thread("../malicious"))
+        self.assertFalse(thread_store.save_thread({"id": "../evil", "messages": []}))
+
+        # API endpoint checks
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            # Traversal thread ID in GET
+            res_get = await client.get("/api/threads/evil..traversal")
+            self.assertEqual(res_get.status_code, 400)
+            self.assertIn("Invalid thread_id format", res_get.json()["error"])
+
+            # Malformed characters in PUT
+            res_put = await client.put("/api/threads/invalid*id!", json={"title": "Test Title"})
+            self.assertEqual(res_put.status_code, 400)
+
+            # Malformed characters in DELETE
+            res_del = await client.delete("/api/threads/invalid;id")
+            self.assertEqual(res_del.status_code, 400)
+
+    # -----------------------------------------------------------------------
+    # 26. Production Mode Protects Server Environment Configuration
+    # -----------------------------------------------------------------------
+    async def test_26_production_mode_protects_env_settings(self):
+        """In production environment, modifying settings via API requires explicit header authorization."""
+        import config
+        from api import app
+        from httpx import AsyncClient, ASGITransport
+
+        orig_env = config.ENVIRONMENT
+        orig_key = config.DEV_MODE_KEY
+
+        try:
+            config.ENVIRONMENT = "production"
+            config.DEV_MODE_KEY = "super-secret-prod-key-777"
+
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                # 1. Unauthenticated request in production must be rejected with 403 Forbidden
+                payload = {"model": "llama-3.3-70b-versatile"}
+                res_unauth = await client.post("/api/settings/groq", json=payload)
+                self.assertEqual(res_unauth.status_code, 403)
+                self.assertIn("restricted in production mode", res_unauth.json()["error"])
+
+                # 2. Authenticated request with X-Dev-Key header succeeds
+                headers = {"X-Dev-Key": "super-secret-prod-key-777"}
+                res_auth = await client.post("/api/settings/groq", json=payload, headers=headers)
+                self.assertEqual(res_auth.status_code, 200)
+                self.assertEqual(res_auth.json()["status"], "success")
+        finally:
+            config.ENVIRONMENT = orig_env
+            config.DEV_MODE_KEY = orig_key
+
+    # -----------------------------------------------------------------------
+    # 27. Cross-Platform TTS Graceful Fallback
+    # -----------------------------------------------------------------------
+    def test_27_cross_platform_tts_graceful_fallback(self):
+        """TTS Engine must operate safely on non-Windows environments without crashing."""
+        import core.tts
+        from core.tts import tts_engine
+
+        # Temporarily simulate non-Windows environment with no SAPI
+        orig_has_win32 = core.tts.HAS_WIN32
+        orig_mci = tts_engine._mci
+        try:
+            core.tts.HAS_WIN32 = False
+            tts_engine._mci = None
+            # SAPI speaker fallback returns None gracefully when win32 is unavailable
+            self.assertIsNone(tts_engine._get_sapi_speaker())
+
+            # speak executes safely on non-Windows environments without crashing
+            tts_engine.speak("Cross-platform test utterance")
+
+            # Stopping speech succeeds silently
+            tts_engine.stop()
+        finally:
+            core.tts.HAS_WIN32 = orig_has_win32
+            tts_engine._mci = orig_mci
+
 
 if __name__ == "__main__":
     unittest.main()

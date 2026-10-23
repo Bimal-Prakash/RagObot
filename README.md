@@ -1,91 +1,193 @@
 # 🤖 RagObot: Multi-Agent Concurrent RAG Matrix
-RagObot was Built by Bimal P B
+**Built by Bimal P B**
 
-RagObot is a headless, highly optimized multi-agent Retrieval-Augmented Generation (RAG) system built with **LangGraph**. It orchestrates local compute (**Ollama**) and cloud compute (**Groq LPU**) concurrently, strictly monitors rolling context window budgets, displays live thought calculations on a futuristic **React Cyber-Console** (or interactive terminal console via **Rich**), and dispatches final responses to native Windows Text-to-Speech via **WinSDK SAPI** (with toggleable browser Web Speech).
+[![CI](https://github.com/Bimal-Prakash/RagObot/actions/workflows/ci.yml/badge.svg)](https://github.com/Bimal-Prakash/RagObot/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python: 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com)
+[![LangGraph](https://img.shields.io/badge/LangGraph-0.2+-orange.svg)](https://github.com/langchain-ai/langgraph)
+[![React](https://img.shields.io/badge/React-18-61DAFB.svg)](https://react.dev)
+
+RagObot is a production-conscious, multi-agent Retrieval-Augmented Generation (RAG) system built on **LangGraph**. It orchestrates local compute (**Ollama**) and cloud compute (**Groq LPU**) concurrently, verifies retrieved evidence with a fail-closed consensus arbiter, enforces strict factual grounding boundaries, and streams real-time events over Server-Sent Events (SSE) to a futuristic **React Cyber-Console**.
 
 ---
 
-## 🗺️ System Architecture & Workflow
+## 🗺️ System Architecture
 
 ```mermaid
 flowchart TD
-    A[User query] --> B[Retrieve ChromaDB chunks]
-    B --> C{Relevant evidence available?}
-    C -- No --> D[Return abstention]
-    C -- Yes --> E[Ollama and Groq workers]
-    E --> F[Consensus arbiter]
-    F --> G{Answer grounded in sources?}
-    G -- No --> D
-    G -- Yes --> H[Final response and TTS]
+    A[User Query & Session Context] --> B[ChromaDB Dense Retrieval]
+    B --> C{Relevant Evidence Available?}
+    C -- No / Evaluation Timeout --> D[Return Abstention Node]
+    C -- Yes --> E[Concurrent Workers: Ollama Local + Groq Cloud]
+    E --> F[Consensus Arbiter & Cross-Examination]
+    F --> G{Answer Grounded in Sources?}
+    G -- No / Partial Unsupported --> D
+    G -- Yes --> H[Verified Final Consensus & Neural Audio]
 ```
 
 ---
 
-## 🛠️ Core Pillars & Implementation
+## 🛡️ Open-Source Security & Grounding Guarantees
 
-1. **Fail-Closed Concurrency Orchestration Layer (`langgraph`)**:
-   - Follows strict evidence validation and factual grounding gates (`mermaid-diagram.png`).
-   - `START` routes to `Retrieve ChromaDB chunks` with context-aware query reformulation and upload-document targeting.
-   - **Relevant evidence available?**: Evaluates retrieved chunks strictly. If evidence is missing, below threshold (0.45), or the evaluator is unavailable, the pipeline **fails closed** to `Return abstention` (no fail-open similarity-only bypasses).
-   - **Ollama and Groq workers**: Executes concurrent compute nodes (`ollama_worker` & `groq_worker`) in parallel via `asyncio`. Worker streams are quarantined behind the validation boundary during computation to prevent unverified content leaks.
-   - **Consensus Arbiter**: Impartial arbitrator evaluates blinded candidate perspectives with randomized presentation order against verified source chunks. If arbiter models fail or time out, the system fails closed to abstention instead of fabricating fallback claims.
-   - **Answer grounded in sources?**: Multi-layer factual grounding validation:
-     - Delimits source evidence in `<untrusted_source_evidence>` tags to defend against prompt injection.
-     - Runs deterministic claim verification on numbers, dates, and metrics against source text.
-     - Subjected to independent secondary revalidation if answers are pruned under `PARTIALLY_SUPPORTED`.
-     - Any residual unsupported claims immediately route to `Return abstention`.
-   - **Final response and TTS**: Dispatches the verified, grounded response to native Windows SAPI TTS and UI.
-   - Ingestion protocol reads structured Markdown (`.md`) files using `MarkdownHeaderTextSplitter` to retain semantic header hierarchy (`#`, `##`, `###`).
-2. **Dual-Engine Compute Matrix (`groq` + `ollama`)**:
-   - **Groq Cloud Engine**: Powered by `ChatGroq` (`llama-3.3-70b-versatile`) as the structural supervisor.
-   - **Ollama Local Matrix**: Powered by `ChatOllama` (`llama3.2:3b` / `llama3`) for localized verification.
-3. **Consensus Arbiter & Grounding Boundary**:
-   - Worker generation streams remain internal during execution; only verified consensus responses reach the primary conversation stream. Audited candidate drafts and cross-examination notes are accessible for post-run inspection in the 2-Window Debate Arena.
-   - Source citations emitted to the client are traceable directly to the exact chunks evaluated in the completed graph state.
-4. **Context Window & Token Budget Management**:
-   - Guarded by `trim_messages()` with `strategy="last"` and `include_system=True`.
-   - Prunes history when total tokens exceed `MAX_CONTEXT_TOKENS` (default: 2,000) while permanently anchoring system RAG rules.
-   - Live visual alert badge activates whenever trimming occurs.
-5. **Headless Native Hardware Voice Pipeline (`win32com`) & Hybrid Web Speech**:
-   - Dispatches synthesized text directly to Windows SAPI SpVoice asynchronously (`SVSFlagsAsync`) with zero UI lag.
-   - React UI also features toggleable browser Web Speech synthesis for direct tab audio.
-6. **Cyber-Console React Web UI (`frontend/`)**:
-   - Glassmorphic cyberpunk aesthetic with neon glowing borders, dynamic thought streams, and real-time Server-Sent Events (SSE).
-   - Side-by-side stream columns for Ollama (Cyan) and Groq (Yellow) in real time.
-   - Live rolling token budget gauge bar with automatic pruning alerts.
-   - Retrieved Markdown boundaries viewer with breadcrumbs and similarity scores.
+1. **Header-Only Developer Diagnostic Authorization**:
+   - Secrets (`DEV_MODE_KEY`) are accepted **exclusively** via HTTP headers (`X-Dev-Key` or `Authorization: Bearer`).
+   - Query parameters and request body fields containing developer keys are strictly rejected to prevent secret leakage in server logs, reverse-proxy access logs, and browser history.
+   - When running in `ENVIRONMENT=production`, diagnostic mode cannot be bypassed without key validation even if local debug flags are set.
+
+2. **Strict Public vs. Diagnostic Response Schemas**:
+   - **Public Mode (Default)**: Emits only verified public fields (`id`, `role`, `content`, `timestamp`, `sources`, `evidenceAvailable`, `answerGrounded`, `isAbstained`). Internal model reasoning, raw candidate worker drafts (`ollamaStream`, `groqStream`), arbiter debate transcripts, and grounding reasons are completely excluded from the payload.
+   - **Developer Mode**: Enabled only when explicitly requested and authenticated via header. Grants full visibility into worker drafts, debate resolution, and token metrics.
+
+3. **Multi-Stage Fail-Closed Grounding**:
+   - **Evidence Gate**: Evaluates semantic similarity and relevance. If chunks fall below threshold or the evaluator emits ambiguous verdicts, the system fails closed to `return_abstention`.
+   - **Prompt-Injection Isolation**: Retrieved source texts and worker drafts are quarantined inside boundary delimiters (`<untrusted_source_evidence>`) before reaching the arbiter.
+   - **Deterministic Numeric & Date Validator**: Extracts numerical metrics, dates, and percentages from synthesized text and verifies their literal presence in source documents. Hallucinated numbers trigger immediate rejection.
+
+4. **Upload & Path Traversal Hardening**:
+   - Thread IDs are strictly validated against `^[a-zA-Z0-9_\-]{1,64}$` to prevent directory traversal and file injection.
+   - Uploaded files are sanitized to their base names, restricted to allowlisted extensions (`.md`, `.markdown`, `.txt`, `.pdf`), and capped at 25 MB.
+
+5. **Cross-Platform Compatibility**:
+   - Runs natively on Linux, macOS, and Windows. Windows-specific APIs (`pywin32`, Windows MCI) are conditionally loaded with automatic graceful fallbacks to Microsoft Edge Neural TTS.
 
 ---
 
-## 🚀 Getting Started
+## 🚀 Quickstart
 
-### 1. Install Backend Dependencies
-```powershell
-.venv\Scripts\pip install -r requirements.txt
+### Prerequisites
+- **Python 3.11+**
+- **Node.js 20+**
+- *(Optional)* [Ollama](https://ollama.com/) running locally for offline inference (`ollama run llama3.2`).
+- *(Optional)* [Groq API Key](https://console.groq.com/) for high-speed cloud LPU reasoning.
+
+### 1. Clone & Set Up Python Environment
+
+```bash
+git clone https://github.com/Bimal-Prakash/RagObot.git
+cd RagObot
+
+# Create virtual environment
+python -m venv .venv
+
+# Activate virtual environment
+# Windows (PowerShell):
+.venv\Scripts\Activate.ps1
+# Windows (cmd):
+.venv\Scripts\activate.bat
+# Linux / macOS:
+source .venv/bin/activate
+
+# Install backend dependencies
+pip install -r requirements.txt
 ```
 
 ### 2. Configure Environment
+
 Copy `.env.example` to `.env`:
-```powershell
+```bash
+# Windows
 copy .env.example .env
+# Linux / macOS
+cp .env.example .env
 ```
-Add your Groq API key and preferred models in `.env`.
+Edit `.env` to configure your API keys and model preferences.
 
-### 3. Run the Backend API (FastAPI)
-```powershell
-.venv\Scripts\python -m uvicorn api:app --reload --port 8000
+### 3. Start the Backend API
+
+```bash
+python -m uvicorn api:app --reload --host 127.0.0.1 --port 8000
 ```
+API docs will be available at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
 
-### 4. Run the React Frontend
-In a new terminal window:
-```powershell
+### 4. Start the React Frontend
+
+In a separate terminal:
+```bash
 cd frontend
 npm install
 npm run dev
 ```
 Open **`http://localhost:5173`** in your browser.
 
-*(Optional)* You can also still run the pure terminal cyber-console anytime:
-```powershell
-.venv\Scripts\python main.py
+*(Optional)* You can also run the interactive Rich terminal console anytime:
+```bash
+python main.py
 ```
+
+---
+
+## ⚙️ Configuration Reference
+
+All settings can be configured via environment variables or `.env`:
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENVIRONMENT` | `development` | Deployment environment (`development`, `staging`, `production`). |
+| `HOST` | `127.0.0.1` | Network interface to bind the FastAPI server. |
+| `PORT` | `8000` | Port for the FastAPI server. |
+| `ALLOWED_ORIGINS` | `http://localhost:5173,...` | Comma-delimited list of allowed CORS origins. |
+| `DEV_MODE_KEY` | *(empty)* | Secret key required to access developer diagnostic mode. |
+| `ALLOW_UNAUTHENTICATED_DEV_MODE` | `false` | Allows dev mode without a key in non-production environments. |
+| `GROQ_API_KEY` | *(empty)* | API key for Groq cloud LPU inference. |
+| `GROQ_MODEL` | `llama-3.3-70b-versatile` | Cloud model identifier for Groq. |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Endpoint for local Ollama instance. |
+| `OLLAMA_MODEL` | `llama3.2` | Local model tag for Ollama. |
+| `EMBEDDING_MODEL` | `nomic-embed-text` | ChromaDB dense embedding model. |
+| `ARBITER_ENGINE` | `groq` | Engine used for arbitration (`groq` or `ollama`). |
+| `MAX_CONTEXT_TOKENS` | `2000` | Context window token budget before automated trimming. |
+| `TOP_K_CHUNKS` | `3` | Maximum semantic chunks retrieved per query. |
+| `TTS_ENABLED` | `true` | Enables speech synthesis backend. |
+| `TTS_VOICE` | `en-US-JennyNeural` | Voice identifier for Microsoft Edge Neural TTS. |
+
+---
+
+## 📡 API Reference
+
+### Core Endpoints
+
+- `POST /api/query`: SSE streaming endpoint executing LangGraph multi-agent execution. Emits `docs`, `ollama_token`, `groq_token`, `evidence_status`, `validation_status`, and `consensus`.
+- `POST /api/upload`: Uploads and parses markdown, text, or PDF documents into ChromaDB.
+- `GET /api/models`: Returns available local Ollama and cloud Groq models.
+- `GET /api/status`: Returns runtime metrics, context token consumption, and model availability.
+- `GET /api/threads`: Lists saved chat threads.
+- `GET /api/threads/{thread_id}`: Retrieves complete chat history. Provide `X-Dev-Key` or `Authorization: Bearer <key>` with `?dev_mode=true` to view internal diagnostic drafts and debate logs.
+- `POST /api/threads`: Creates a new conversation thread.
+- `PUT /api/threads/{thread_id}`: Updates thread title.
+- `DELETE /api/threads/{thread_id}`: Deletes a conversation thread.
+- `POST /api/voice/synthesize`: Synthesizes expressive neural audio (MP3) for browser streaming.
+
+---
+
+## 🧪 Testing & Verification
+
+RagObot includes a comprehensive automated test suite with 47+ deterministic tests verifying:
+- Prompt injection isolation
+- Evaluator verdict consistency & fail-closed behavior
+- Deterministic claim and numeric validator
+- Header-only developer authorization & schema filtering
+- Path traversal & upload payload validation
+- Cross-platform TTS fallbacks
+
+Run the backend test suite:
+```bash
+python -m unittest discover tests
+```
+
+Build the frontend production bundle:
+```bash
+cd frontend
+npm run build
+```
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on code standards, automated testing, and submitting pull requests.
+
+---
+
+## 📄 License
+
+RagObot is licensed under the [MIT License](LICENSE).

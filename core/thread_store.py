@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import uuid
 import time
@@ -29,10 +30,14 @@ class ThreadStore:
         self.storage_dir = storage_dir
         self.storage_dir.mkdir(parents=True, exist_ok=True)
 
-    def _get_path(self, thread_id: str) -> Path:
-        # Sanitize thread_id to prevent directory traversal
-        safe_id = "".join(c for c in thread_id if c.isalnum() or c in ("-", "_"))
-        return self.storage_dir / f"{safe_id}.json"
+    def _get_path(self, thread_id: str) -> Optional[Path]:
+        # Strictly validate thread_id format to prevent directory traversal and null access
+        if not thread_id or not isinstance(thread_id, str):
+            return None
+        clean = thread_id.strip()
+        if not re.match(r"^[a-zA-Z0-9_\-]{1,64}$", clean):
+            return None
+        return self.storage_dir / f"{clean}.json"
 
     def list_threads(self) -> list[dict[str, Any]]:
         """Returns all saved threads sorted by updated_at descending."""
@@ -60,7 +65,7 @@ class ThreadStore:
     def get_thread(self, thread_id: str) -> Optional[dict[str, Any]]:
         """Loads complete thread with full message history."""
         path = self._get_path(thread_id)
-        if not path.exists():
+        if not path or not path.exists():
             return None
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -107,6 +112,8 @@ class ThreadStore:
         if not thread_id:
             return False
         path = self._get_path(thread_id)
+        if not path:
+            return False
         temp_path = path.with_suffix(".tmp")
         try:
             with open(temp_path, "w", encoding="utf-8") as f:
@@ -133,13 +140,13 @@ class ThreadStore:
     def delete_thread(self, thread_id: str) -> bool:
         """Deletes a thread file from disk."""
         path = self._get_path(thread_id)
-        if path.exists():
-            try:
-                path.unlink()
-                return True
-            except Exception:
-                return False
-        return False
+        if not path or not path.exists():
+            return False
+        try:
+            path.unlink()
+            return True
+        except Exception:
+            return False
 
     def append_turn(
         self,

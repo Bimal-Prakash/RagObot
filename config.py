@@ -4,6 +4,7 @@ Structured schema validation powered by Pydantic v2 BaseSettings.
 Loads environment variables from .env or system environment with strict typing.
 """
 from pathlib import Path
+from typing import Any
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -16,6 +17,8 @@ class AppConfig(BaseSettings):
 
     # Core Directories & Environment
     ENVIRONMENT: str = Field(default="development", description="Deployment environment ('development', 'staging', 'production')")
+    HOST: str = Field(default="127.0.0.1", description="Server host address to bind")
+    PORT: int = Field(default=8000, description="Server port to bind")
     ALLOWED_ORIGINS: list[str] = Field(
         default=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000", "http://127.0.0.1:3000"],
         description="Allowed CORS origins list"
@@ -48,6 +51,16 @@ class AppConfig(BaseSettings):
     TTS_RATE: int = Field(default=0, description="Speech rate offset (-10 to +10)")
     TTS_VOLUME: int = Field(default=100, description="Speech volume (0 to 100)")
 
+    @model_validator(mode="before")
+    @classmethod
+    def parse_allowed_origins(cls, data: Any) -> Any:
+        """Parses comma-separated string format for ALLOWED_ORIGINS into list of URLs."""
+        if isinstance(data, dict):
+            origins = data.get("ALLOWED_ORIGINS")
+            if isinstance(origins, str):
+                data["ALLOWED_ORIGINS"] = [o.strip() for o in origins.split(",") if o.strip()]
+        return data
+
     @model_validator(mode="after")
     def validate_production_security(self) -> 'AppConfig':
         """Enforces that unauthenticated developer mode cannot be enabled in production deployments."""
@@ -63,6 +76,8 @@ settings = AppConfig()
 
 # Clean module-level exports for backward compatibility across all imports
 ENVIRONMENT = settings.ENVIRONMENT
+HOST = settings.HOST
+PORT = settings.PORT
 ALLOWED_ORIGINS = settings.ALLOWED_ORIGINS
 BASE_DIR = settings.BASE_DIR
 DATA_DIR = settings.DATA_DIR

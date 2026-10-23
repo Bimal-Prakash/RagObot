@@ -6,8 +6,16 @@ import tempfile
 import threading
 from pathlib import Path
 from typing import Optional
-import pythoncom
-import win32com.client
+
+try:
+    import pythoncom
+    import win32com.client
+    HAS_WIN32 = True
+except (ImportError, AttributeError):
+    HAS_WIN32 = False
+    pythoncom = None
+    win32com = None
+
 import config
 
 try:
@@ -71,13 +79,18 @@ class NativeVoicePipeline:
         self.volume = config.TTS_VOLUME
         self._speaker = None
         self._current_audio_alias = "ragobot_speech"
-        self._mci = ctypes.windll.winmm.mciSendStringW
+        if hasattr(ctypes, "windll") and hasattr(ctypes.windll, "winmm"):
+            self._mci = ctypes.windll.winmm.mciSendStringW
+        else:
+            self._mci = None
         self._temp_dir = Path(tempfile.gettempdir()) / "ragobot_audio"
         self._temp_dir.mkdir(parents=True, exist_ok=True)
         self._initialized = True
         
     def _get_sapi_speaker(self):
         """Thread-safe SAPI speaker initialization as fallback."""
+        if not HAS_WIN32 or pythoncom is None or win32com is None:
+            return None
         try:
             pythoncom.CoInitialize()
         except Exception:
@@ -132,26 +145,28 @@ class NativeVoicePipeline:
                     loop.run_until_complete(communicate.save(str(temp_mp3)))
                     loop.close()
                     
-                    # Play via Windows MCI
-                    alias = f"ragobot_{threading.get_ident()}"
-                    self._current_audio_alias = alias
-                    self._mci(f'open "{temp_mp3}" type mpegvideo alias {alias}', None, 0, None)
-                    self._mci(f"play {alias} wait", None, 0, None)
-                    self._mci(f"close {alias}", None, 0, None)
+                    # Play via Windows MCI if available
+                    if self._mci is not None:
+                        alias = f"ragobot_{threading.get_ident()}"
+                        self._current_audio_alias = alias
+                        self._mci(f'open "{temp_mp3}" type mpegvideo alias {alias}', None, 0, None)
+                        self._mci(f"play {alias} wait", None, 0, None)
+                        self._mci(f"close {alias}", None, 0, None)
                     
                     try:
                         temp_mp3.unlink(missing_ok=True)
                     except Exception:
                         pass
                     return
-                except Exception as e:
+                except Exception:
                     # Fallback to SAPI
                     pass
 
             # Fallback to SAPI 5.x
             try:
                 speaker = self._get_sapi_speaker()
-                speaker.Speak(speech_text, SVSFlagsAsync | SVSFPurgeBeforeSpeak)
+                if speaker is not None:
+                    speaker.Speak(speech_text, SVSFlagsAsync | SVSFPurgeBeforeSpeak)
             except Exception:
                 pass
                 
@@ -161,7 +176,7 @@ class NativeVoicePipeline:
     def stop(self) -> None:
         """Immediately abort any active neural audio or SAPI speech."""
         try:
-            if self._current_audio_alias:
+            if self._mci is not None and self._current_audio_alias:
                 self._mci(f"stop {self._current_audio_alias}", None, 0, None)
                 self._mci(f"close {self._current_audio_alias}", None, 0, None)
         except Exception:
