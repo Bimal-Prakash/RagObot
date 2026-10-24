@@ -36,10 +36,12 @@ class AppConfig(BaseSettings):
     OLLAMA_MODEL: str = Field(default="llama3.2", description="Default model executed via Ollama")
     EMBEDDING_MODEL: str = Field(default="nomic-embed-text", description="ChromaDB dense embedding model")
 
-    # Multi-Agent Coordination
+    # Multi-Agent Coordination & Retrieval
     ARBITER_ENGINE: str = Field(default="groq", description="Consensus arbiter engine ('groq' or 'ollama')")
-    MAX_CONTEXT_TOKENS: int = Field(default=2000, description="Rolling context window token limit")
-    TOP_K_CHUNKS: int = Field(default=3, description="Semantic chunks retrieved per user query")
+    MAX_CONTEXT_TOKENS: int = Field(default=3500, description="Rolling context window token limit")
+    TOP_K_CHUNKS: int = Field(default=5, description="Semantic chunks retrieved per user query")
+    CHUNK_SIZE: int = Field(default=1000, description="Character size of text chunks for dense retrieval")
+    CHUNK_OVERLAP: int = Field(default=150, description="Character overlap between consecutive chunks")
 
     # Security & Developer Access Control
     DEV_MODE_KEY: str = Field(default="", description="Secret key for developer diagnostic access")
@@ -90,6 +92,8 @@ EMBEDDING_MODEL = settings.EMBEDDING_MODEL
 ARBITER_ENGINE = settings.ARBITER_ENGINE
 MAX_CONTEXT_TOKENS = settings.MAX_CONTEXT_TOKENS
 TOP_K_CHUNKS = settings.TOP_K_CHUNKS
+CHUNK_SIZE = settings.CHUNK_SIZE
+CHUNK_OVERLAP = settings.CHUNK_OVERLAP
 DEV_MODE_KEY = settings.DEV_MODE_KEY
 ALLOW_UNAUTHENTICATED_DEV_MODE = settings.ALLOW_UNAUTHENTICATED_DEV_MODE
 TTS_ENABLED = settings.TTS_ENABLED

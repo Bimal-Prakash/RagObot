@@ -135,8 +135,10 @@ All settings can be configured via environment variables or `.env`:
 | `OLLAMA_MODEL` | `llama3.2` | Local model tag for Ollama. |
 | `EMBEDDING_MODEL` | `nomic-embed-text` | ChromaDB dense embedding model. |
 | `ARBITER_ENGINE` | `groq` | Engine used for arbitration (`groq` or `ollama`). |
-| `MAX_CONTEXT_TOKENS` | `2000` | Context window token budget before automated trimming. |
-| `TOP_K_CHUNKS` | `3` | Maximum semantic chunks retrieved per query. |
+| `MAX_CONTEXT_TOKENS` | `3500` | Context window token budget before automated trimming. |
+| `TOP_K_CHUNKS` | `5` | Maximum semantic chunks retrieved per query. |
+| `CHUNK_SIZE` | `1000` | Character size for dense text chunking. |
+| `CHUNK_OVERLAP` | `150` | Character overlap between consecutive chunks. |
 | `TTS_ENABLED` | `true` | Enables speech synthesis backend. |
 | `TTS_VOICE` | `en-US-JennyNeural` | Voice identifier for Microsoft Edge Neural TTS. |
 

@@ -50,8 +50,8 @@ class RAGEngine:
             strip_headers=False
         )
         self.sub_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,
-            chunk_overlap=100
+            chunk_size=getattr(config, "CHUNK_SIZE", 1000),
+            chunk_overlap=getattr(config, "CHUNK_OVERLAP", 150)
         )
 
     def _get_client(self) -> chromadb.PersistentClient:
