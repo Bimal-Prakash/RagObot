@@ -118,6 +118,7 @@ CRITICAL EVALUATION RULES:
 1. Do NOT confuse general topical similarity (e.g. discussing engines) with containing the specific evidence needed to answer the query (e.g. discussing six-stroke engines).
 2. If the user asks about a specific mechanism, entity, version, or concept (such as a six-stroke engine) and the text only discusses a different concept (such as a four-stroke engine) without explaining the requested mechanism, output VERDICT: NO.
 3. If the snippets do not contain information sufficient to answer the specific query, output VERDICT: NO.
+4. For overview, summary, or exploratory queries (e.g. asking to explain, summarize, or describe a document), if the snippets provide key details, purpose, sections, or excerpts from that document, output VERDICT: YES.
 
 User Query (Untrusted User Input):
 <user_query>
@@ -222,7 +223,7 @@ async def assess_evidence_relevance(
     if max_score < 0.45:
         return False, f"Semantic similarity score ({max_score:.2f}) is below evidence threshold (0.45)."
 
-    snippets = "\n".join([f"- {d.get('breadcrumb', 'General')}: {sanitize_untrusted_text(d.get('content', ''))[:220]}" for d in retrieved_docs])
+    snippets = "\n".join([f"- {d.get('breadcrumb', 'General')}: {sanitize_untrusted_text(d.get('content', ''))[:600]}" for d in retrieved_docs])
     prompt = RELEVANCE_EVALUATOR_PROMPT.format(query=sanitize_untrusted_text(query), snippets=snippets)
 
     # 1. Try cloud model first (Groq) if available
@@ -539,9 +540,10 @@ async def contextualize_query_for_retrieval(
         if any(term in q_lower for term in [
             "things inside", "inside this", "what is inside", "what's inside",
             "what is in this", "what does this say", "summarize this",
-            "what is this", "tell me about this", "contents of this", "what are the things"
+            "what is this", "tell me about this", "contents of this", "what are the things",
+            "explain what is in this", "explain this document", "explain the document", "explain"
         ]):
-            return f"What are the contents, sections, instructions, and details inside {clean_target_doc}?", target_doc
+            return f"Explain the contents, purpose, and key details inside {clean_target_doc}.", target_doc
 
     # If no history and no target doc, return raw query
     if not history_text and not target_doc:
@@ -597,7 +599,7 @@ Standalone Search Query:"""
         pass
 
     if target_doc:
-        return f"What are the contents, sections, and details inside {target_doc}?", target_doc
+        return f"Explain the contents, purpose, and key details inside {target_doc}.", target_doc
 
     return query, None
 
